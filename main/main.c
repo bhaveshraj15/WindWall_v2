@@ -5,7 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led_strip.h"
-//#include "led_strip_rmt.h"
+#include "esp_mac.h"
 
 #define BLINK_GPIO 48
 
@@ -35,6 +35,12 @@ void set_led_color(int r, int g, int b, int timeout_ms, int blank_ms) {
 
 void app_main(void){
     init_led_strip();
+
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);  // Get MAC for Wi-Fi station
+
+    printf("MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\n",mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     while (1) {
         set_led_color(0, 32, 0, 500, 500); // green
         set_led_color(32, 0, 0, 500, 500); // red
