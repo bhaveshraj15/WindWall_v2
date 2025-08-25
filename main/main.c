@@ -37,5 +37,8 @@ void app_main(void){
     init_led_strip();
     while (1) {
         set_led_color(0, 32, 0, 500, 500); // green
+        set_led_color(32, 0, 0, 500, 500); // red
+        set_led_color(0, 0, 32, 500, 500); // blue
+        set_led_color(32, 32, 32, 500, 500); // white
     }
 }
