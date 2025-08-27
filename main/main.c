@@ -432,14 +432,14 @@ void app_main(void){
     while (1) {
         vTaskDelay(5000 / portTICK_PERIOD_MS);
         // Only send if we have paired peers
-        bool has_paired_peers = false;
         for (int i = 0; i < peer_count; i++) {
-            if (peers[i].paired) {
-                has_paired_peers = true;
-                break;
+            if (peers[i].paired && (xTaskGetTickCount() * portTICK_PERIOD_MS - last_peer_activity[i] > PEER_TIMEOUT_MS)) {
+                ESP_LOGW(TAG, "Peer timeout: " MACSTR, MAC2STR(peers[i].mac));
+                remove_peer(peers[i].mac);
+                i--;
             }
         }
-        if (has_paired_peers) {
+        if (peer_count > 0) {
             char data[50];
             snprintf(data, sizeof(data), "Hello from ESP32! Count: %d", counter++);
             
@@ -449,11 +449,14 @@ void app_main(void){
                 }
             }
             set_led_color(32, 32, 32, 500, 500); // White flash when sending data
-        } else {
-                // No paired peers, try to discover again
+        } else if (!discovery_complete) {
                 ESP_LOGW(TAG, "No paired peers, sending discovery request");
                 send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
+                discovery_complete = true; // Mark discovery as complete
                 set_led_color(32, 16, 0, 500, 500); // Orange flash for discovery
+        } else {
+            // No peers and discovery already completed
+            set_led_color(32, 0, 0, 500, 500); // Red flash for no peers
         }
     }
 }
