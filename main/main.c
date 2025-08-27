@@ -53,6 +53,13 @@ void init_led_strip(){
 } 
 
 void set_led_color(int r, int g, int b, int timeout_ms, int blank_ms) {
+    // Validate parameters
+    r = (r < 0) ? 0 : (r > 255) ? 255 : r;
+    g = (g < 0) ? 0 : (g > 255) ? 255 : g;
+    b = (b < 0) ? 0 : (b > 255) ? 255 : b;
+    timeout_ms = (timeout_ms < 0) ? 0 : timeout_ms;
+    blank_ms = (blank_ms < 0) ? 0 : blank_ms;
+
     ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, r, g, b));
     ESP_ERROR_CHECK(led_strip_refresh(led_strip));
     vTaskDelay(pdMS_TO_TICKS(timeout_ms));
@@ -69,7 +76,8 @@ static const char *LMK = "abcdef0123456789"; // 16-byte LMK
 typedef enum {
     MSG_PAIRING_REQUEST,
     MSG_PAIRING_RESPONSE,
-    MSG_DATA
+    MSG_DATA,
+    MSG_LED_CONTROL
 } message_type_t;
 
 // Message structure
@@ -235,6 +243,18 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
             ESP_LOGI(TAG, "Data message: %s", (char *)msg->data);
             set_led_color(32, 32, 32, 100, 50); // White flash for data received
             break;
+        case MSG_LED_CONTROL:
+            ESP_LOGI(TAG, "LED control message received");
+            // Parse the LED control parameters
+            int r, g, b, timeout_ms, blank_ms;
+            if (sscanf((char *)msg->data, "%d,%d,%d,%d,%d", &r, &g, &b, &timeout_ms, &blank_ms) == 5) {
+                ESP_LOGI(TAG, "Setting LED: R=%d, G=%d, B=%d, Timeout=%dms, Blank=%dms", 
+                         r, g, b, timeout_ms, blank_ms);
+                set_led_color(r, g, b, timeout_ms, blank_ms);
+            } else {
+                ESP_LOGE(TAG, "Invalid LED control format");
+            }
+            break;
         default:
             ESP_LOGE(TAG, "Unknown message type: %d", msg->msg_type);
             break;
@@ -316,6 +336,55 @@ void process_uart_command(char* command) {
             uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
         }
     }
+    else if (strstr(command, "led ")) {
+        // LED control command: led <r> <g> <b> <timeout_ms> <blank_ms> [<mac>]
+        // If MAC is provided, send to that device; otherwise, set locally and broadcast to all peers
+        int r, g, b, timeout_ms, blank_ms;
+        char mac_str[20] = {0};
+        
+        // Parse parameters
+        int parsed = sscanf(command + 4, "%d %d %d %d %d %17s", 
+                           &r, &g, &b, &timeout_ms, &blank_ms, mac_str);
+        
+        if (parsed >= 5) {
+            // Format the LED control data
+            char led_data[50];
+            snprintf(led_data, sizeof(led_data), "%d,%d,%d,%d,%d", r, g, b, timeout_ms, blank_ms);
+            
+            if (parsed == 6) {
+                // Send to specific MAC
+                uint8_t mac[6];
+                if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+                          &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+                    send_message(mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
+                    uart_write_bytes(UART_PORT_NUM, "LED command sent to specific device\n", 
+                                    strlen("LED command sent to specific device\n"));
+                } else {
+                    uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
+                }
+            } else {
+                // Set locally and broadcast to all peers
+                set_led_color(r, g, b, timeout_ms, blank_ms);
+                
+                // Send to all paired peers
+                for (int i = 0; i < peer_count; i++) {
+                    if (peers[i].paired) {
+                        send_message(peers[i].mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
+                    }
+                }
+                uart_write_bytes(UART_PORT_NUM, "LED command set locally and sent to all peers\n", 
+                                strlen("LED command set locally and sent to all peers\n"));
+            }
+        } else {
+            uart_write_bytes(UART_PORT_NUM, 
+                            "Usage: led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>]\n"
+                            "Example: led 255 0 0 1000 500\n"
+                            "Example: led 0 255 0 500 200 AA:BB:CC:DD:EE:FF\n", 
+                            strlen("Usage: led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>]\n"
+                                   "Example: led 255 0 0 1000 500\n"
+                                   "Example: led 0 255 0 500 200 AA:BB:CC:DD:EE:FF\n"));
+        }
+    }
     else if (strstr(command, "me")){
         // Get MAC address of the ESP32
         uint8_t mac[6];
@@ -331,6 +400,7 @@ void process_uart_command(char* command) {
             "  send <MAC> <message> - Send message to peer\n"
             "  remove <MAC> - Remove a peer\n"
             "  me - Gives MAC address of Current Device\n"
+            "  led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>] - Control LED (local or remote)\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
     }
