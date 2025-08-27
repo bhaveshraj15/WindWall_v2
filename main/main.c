@@ -316,6 +316,12 @@ void process_uart_command(char* command) {
             uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
         }
     }
+    else if (strstr(command, "me")){
+        // Get MAC address of the ESP32
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        printf("MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n",mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
     else if (strstr(command, "help")) {
         // Show help
         const char *help_text = 
@@ -324,6 +330,7 @@ void process_uart_command(char* command) {
             "  list - List all known peers\n"
             "  send <MAC> <message> - Send message to peer\n"
             "  remove <MAC> - Remove a peer\n"
+            "  me - Gives MAC address of Current Device\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
     }
