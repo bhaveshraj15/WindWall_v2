@@ -55,9 +55,12 @@ typedef enum {
 // Message structure
 typedef struct __attribute__((packed)) {
     message_type_t msg_type;
+    uint32_t sequence_num;
     uint8_t src_mac[6];
-    uint8_t data[240]; // Flexible data field
+    uint8_t data[236]; // Flexible data field
 } esp_now_message_t;
+
+static uint32_t sequence_counter = 0;
 
 // Peer device information
 typedef struct {
@@ -77,6 +80,18 @@ void log_mac(const char *prefix, const uint8_t *mac) {
 
 // Add a peer device
 esp_err_t add_peer(const uint8_t *mac, bool encrypt) {
+    // Check if peer already exists
+    for (int i = 0; i < peer_count; i++) {
+        if (memcmp(peers[i].mac, mac, 6) == 0) {
+            ESP_LOGW(TAG, "Peer already exists");
+            return ESP_OK; // Peer already exists
+        }
+    }
+    // Check if we have space for more peers
+    if (peer_count >= 10) {
+        ESP_LOGE(TAG, "Peer list full");
+        return ESP_ERR_NO_MEM;
+    }
     esp_now_peer_info_t peer_info = {
         .channel = 1,
         .encrypt = encrypt
@@ -87,17 +102,59 @@ esp_err_t add_peer(const uint8_t *mac, bool encrypt) {
     }
     esp_err_t ret = esp_now_add_peer(&peer_info);
     if (ret == ESP_OK) {
+        // Add to our peer list
+        memcpy(peers[peer_count].mac, mac, 6);
+        peers[peer_count].paired = !encrypt; // If encrypted, not paired until response
+        peer_count++;
         log_mac("Peer added:", mac);
+        set_led_color(0, 32, 0, 200, 100); // Green flash for new peer
     } else {
         log_mac("Failed to add peer:", mac);
+        set_led_color(32, 0, 0, 200, 100); // Red flash for error
     }
     return ret;
 }
 
+// Function to remove a peer
+esp_err_t remove_peer(const uint8_t *mac) {
+    esp_err_t ret = esp_now_del_peer(mac);
+    if (ret == ESP_OK) {
+        // Remove from our peer list
+        for (int i = 0; i < peer_count; i++) {
+            if (memcmp(peers[i].mac, mac, 6) == 0) {
+                // Shift remaining peers
+                for (int j = i; j < peer_count - 1; j++) {
+                    memcpy(peers[j].mac, peers[j+1].mac, 6);
+                    peers[j].paired = peers[j+1].paired;
+                }
+                peer_count--;
+                break;
+            }
+        }
+        log_mac("Peer removed:", mac);
+    } else {
+        log_mac("Failed to remove peer:", mac);
+    }
+    return ret;
+}
+
+// Function to list all peers
+void list_peers() {
+    ESP_LOGI(TAG, "Registered peers (%d):", peer_count);
+    for (int i = 0; i < peer_count; i++) {
+        log_mac(peers[i].paired ? "  Paired: " : "  Unpaired: ", peers[i].mac);
+    }
+}
+
 // Send ESP-NOW message
 void send_message(const uint8_t *mac, message_type_t type, const void *data, size_t len) {
+    if (len > sizeof(esp_now_message_t)) {
+        ESP_LOGE(TAG, "Message too long: %d > %d", len, sizeof(esp_now_message_t));
+        return;
+    }
     esp_now_message_t msg;
     msg.msg_type = type;
+    msg.sequence_num = sequence_counter++;
     esp_read_mac(msg.src_mac, ESP_MAC_WIFI_STA);
     if (len > 0) {
         memcpy(msg.data, data, len);
@@ -105,17 +162,25 @@ void send_message(const uint8_t *mac, message_type_t type, const void *data, siz
     esp_err_t ret = esp_now_send(mac, (uint8_t *)&msg, sizeof(msg));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Send error: %d", ret);
+        set_led_color(32, 16, 0, 200, 100); // Orange flash for send error
     }
 }
 
 // Handle received ESP-NOW data
 void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
     if (len < sizeof(esp_now_message_t)) {
-        ESP_LOGE(TAG, "Invalid message length");
+        ESP_LOGE(TAG, "Invalid message length: %d", len);
         return;
     }
     esp_now_message_t *msg = (esp_now_message_t *)data;
+    // Ignore messages from ourselves
+    uint8_t my_mac[6];
+    esp_read_mac(my_mac, ESP_MAC_WIFI_STA);
+    if (memcmp(msg->src_mac, my_mac, 6) == 0) {
+        return;
+    }
     log_mac("Received from:", mac);
+    ESP_LOGI(TAG, "Sequence: %lu, Type: %d", msg->sequence_num, msg->msg_type);
 
     switch (msg->msg_type) {
         case MSG_PAIRING_REQUEST:
@@ -124,6 +189,7 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
             add_peer(mac, true);
             // Send pairing response
             send_message(mac, MSG_PAIRING_RESPONSE, NULL, 0);
+            set_led_color(0, 0, 32, 200, 100); // Blue flash for pairing
             break;
         case MSG_PAIRING_RESPONSE:
             ESP_LOGI(TAG, "Pairing response received");
@@ -131,15 +197,18 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
             for (int i = 0; i < peer_count; i++) {
                 if (memcmp(peers[i].mac, mac, 6) == 0) {
                     peers[i].paired = true;
+                    ESP_LOGI(TAG, "Peer successfully paired");
+                    set_led_color(0, 32, 0, 500, 100); // Green flash for successful pairing
                     break;
                 }
             }
             break;
         case MSG_DATA:
             ESP_LOGI(TAG, "Data message: %s", (char *)msg->data);
+            set_led_color(32, 32, 32, 100, 50); // White flash for data received
             break;
         default:
-            ESP_LOGE(TAG, "Unknown message type");
+            ESP_LOGE(TAG, "Unknown message type: %d", msg->msg_type);
             break;
     }
 }
@@ -157,8 +226,9 @@ void esp_now_send_cb(const uint8_t *mac, esp_now_send_status_t status) {
 
 // Initialize ESP-NOW
 void init_esp_now() {
-    esp_netif_init();
-    esp_event_loop_create_default();
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -177,14 +247,13 @@ void init_esp_now() {
     uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     add_peer(broadcast_mac, false);
 
-    ESP_LOGI(TAG, "ESP-NOW initialized");
+    ESP_LOGI(TAG, "ESP-NOW initialized successfully");
 }
 
 void app_main(void){
-    ESP_ERROR_CHECK(nvs_flash_init());
     init_led_strip();
     init_esp_now();
-
+    set_led_color(0, 32, 0, 1000, 0); // Solid green for ready state
     // Start dynamic discovery by sending a pairing request
     uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
@@ -194,13 +263,29 @@ void app_main(void){
 
     while (1) {
         vTaskDelay(5000 / portTICK_PERIOD_MS);
-        char data[50];
-        snprintf(data, sizeof(data), "Hello from ESP32! Count: %d", counter++);
-        set_led_color(32, 32, 32, 500, 500); // white
+        // Only send if we have paired peers
+        bool has_paired_peers = false;
         for (int i = 0; i < peer_count; i++) {
             if (peers[i].paired) {
-                send_message(peers[i].mac, MSG_DATA, data, strlen(data) + 1);
+                has_paired_peers = true;
+                break;
             }
+        }
+        if (has_paired_peers) {
+            char data[50];
+            snprintf(data, sizeof(data), "Hello from ESP32! Count: %d", counter++);
+            
+            for (int i = 0; i < peer_count; i++) {
+                if (peers[i].paired) {
+                    send_message(peers[i].mac, MSG_DATA, data, strlen(data) + 1);
+                }
+            }
+            set_led_color(32, 32, 32, 500, 500); // White flash when sending data
+        } else {
+                // No paired peers, try to discover again
+                ESP_LOGW(TAG, "No paired peers, sending discovery request");
+                send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
+                set_led_color(32, 16, 0, 500, 500); // Orange flash for discovery
         }
     }
 }
