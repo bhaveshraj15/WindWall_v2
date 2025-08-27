@@ -12,8 +12,28 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
+#include "driver/uart.h"
+#include "esp_vfs_dev.h"
 
 static const char *TAG = "WW_Comm"; //logging tag
+
+// UART configuration
+#define UART_PORT_NUM      UART_NUM_0
+#define UART_BAUD_RATE     115200
+#define UART_BUF_SIZE      1024
+#define UART_QUEUE_LEN     20
+
+static bool discovery_complete = false;
+static uint32_t last_peer_activity[10] = {0};
+#define PEER_TIMEOUT_MS 30000  // 30 seconds timeout
+
+// UART command structure
+typedef struct {
+    char command[20];
+    char params[50];
+} uart_command_t;
+
+static QueueHandle_t uart_queue; // Global variables for UART
 
 #define BLINK_GPIO 48
 
@@ -170,6 +190,7 @@ void send_message(const uint8_t *mac, message_type_t type, const void *data, siz
 void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
     if (len < sizeof(esp_now_message_t)) {
         ESP_LOGE(TAG, "Invalid message length: %d", len);
+        set_led_color(32, 0, 0, 200, 100); // Red flash for error
         return;
     }
     esp_now_message_t *msg = (esp_now_message_t *)data;
@@ -181,7 +202,14 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
     }
     log_mac("Received from:", mac);
     ESP_LOGI(TAG, "Sequence: %lu, Type: %d", msg->sequence_num, msg->msg_type);
-
+    bool peer_found = false;
+    for (int i = 0; i < peer_count; i++) {
+        if (memcmp(peers[i].mac, mac, 6) == 0) {
+            last_peer_activity[i] = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            peer_found = true;
+            break;
+        }
+    }
     switch (msg->msg_type) {
         case MSG_PAIRING_REQUEST:
             ESP_LOGI(TAG, "Pairing request received");
@@ -211,6 +239,10 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
             ESP_LOGE(TAG, "Unknown message type: %d", msg->msg_type);
             break;
     }
+    if (!peer_found && msg->msg_type != MSG_PAIRING_REQUEST) {
+        ESP_LOGW(TAG, "Message from unknown peer, adding to list");
+        add_peer(mac, true);
+    }
 }
 
 // ESP-NOW receive callback
@@ -222,6 +254,141 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
 void esp_now_send_cb(const uint8_t *mac, esp_now_send_status_t status) {
     log_mac("Send status:", mac);
     ESP_LOGI(TAG, "Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+// Process UART commands
+void process_uart_command(char* command) {
+    // Remove newline characters
+    char *newline = strchr(command, '\n');
+    if (newline) *newline = '\0';
+    newline = strchr(command, '\r');
+    if (newline) *newline = '\0';
+    
+    ESP_LOGI(TAG, "UART Command: %s", command);
+    
+    if (strstr(command, "discover")) {
+        // Manual discovery trigger
+        discovery_complete = false;
+        uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
+        uart_write_bytes(UART_PORT_NUM, "Discovery initiated\n", strlen("Discovery initiated\n"));
+    } 
+    else if (strstr(command, "list")) {
+        // List all peers
+        char response[100];
+        snprintf(response, sizeof(response), "Registered peers: %d\n", peer_count);
+        uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+        
+        for (int i = 0; i < peer_count; i++) {
+            snprintf(response, sizeof(response), "Peer %d: " MACSTR " %s\n", 
+                    i, MAC2STR(peers[i].mac), peers[i].paired ? "Paired" : "Unpaired");
+            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+        }
+    }
+    else if (strstr(command, "send ")) {
+        // Send custom message: send <mac> <message>
+        char* mac_str = strtok(command + 5, " ");
+        char* message = strtok(NULL, "");
+        
+        if (mac_str && message) {
+            uint8_t mac[6];
+            if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+                      &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+                send_message(mac, MSG_DATA, message, strlen(message) + 1);
+                uart_write_bytes(UART_PORT_NUM, "Message sent\n", strlen("Message sent\n"));
+            } else {
+                uart_write_bytes(UART_PORT_NUM, "Invalid MAC format. Use AA:BB:CC:DD:EE:FF\n", 
+                                strlen("Invalid MAC format. Use AA:BB:CC:DD:EE:FF\n"));
+            }
+        } else {
+            uart_write_bytes(UART_PORT_NUM, "Usage: send <MAC> <message>\n", 
+                            strlen("Usage: send <MAC> <message>\n"));
+        }
+    }
+    else if (strstr(command, "remove ")) {
+        // Remove a peer: remove <mac>
+        char* mac_str = command + 7;
+        uint8_t mac[6];
+        if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+                  &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+            remove_peer(mac);
+            uart_write_bytes(UART_PORT_NUM, "Peer removed\n", strlen("Peer removed\n"));
+        } else {
+            uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
+        }
+    }
+    else if (strstr(command, "help")) {
+        // Show help
+        const char *help_text = 
+            "Available commands:\n"
+            "  discover - Initiate peer discovery\n"
+            "  list - List all known peers\n"
+            "  send <MAC> <message> - Send message to peer\n"
+            "  remove <MAC> - Remove a peer\n"
+            "  help - Show this help\n";
+        uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
+    }
+    else {
+        uart_write_bytes(UART_PORT_NUM, "Unknown command. Type 'help' for available commands.\n", 
+                        strlen("Unknown command. Type 'help' for available commands.\n"));
+    }
+}
+
+// UART task function
+void uart_task(void *pvParameters) {
+    uart_event_t event;
+    uint8_t* data = (uint8_t*) malloc(UART_BUF_SIZE);
+    
+    while (1) {
+        if (xQueueReceive(uart_queue, &event, portMAX_DELAY)) {
+            switch (event.type) {
+                case UART_DATA:
+                    int len = uart_read_bytes(UART_PORT_NUM, data, event.size, portMAX_DELAY);
+                    data[len] = '\0'; // Null terminate the string
+                    
+                    // Process UART command
+                    process_uart_command((char*)data);
+                    break;
+                    
+                case UART_FIFO_OVF:
+                    uart_flush_input(UART_PORT_NUM);
+                    xQueueReset(uart_queue);
+                    break;
+                    
+                case UART_BUFFER_FULL:
+                    uart_flush_input(UART_PORT_NUM);
+                    xQueueReset(uart_queue);
+                    break;
+                    
+                default:
+                    break;
+            }
+        }
+    }
+    free(data);
+    vTaskDelete(NULL);
+}
+
+// Initialize UART
+void init_uart() {
+    uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE, UART_BUF_SIZE, UART_QUEUE_LEN, &uart_queue, 0));
+    esp_vfs_dev_uart_use_driver(UART_PORT_NUM);
+    
+    // Create UART task
+    xTaskCreate(uart_task, "uart_task", 4096, NULL, 10, NULL);
+    
+    // Print welcome message
+    const char *welcome = "\nESP-NOW Communication System\nType 'help' for available commands\n\n";
+    uart_write_bytes(UART_PORT_NUM, welcome, strlen(welcome));
 }
 
 // Initialize ESP-NOW
@@ -252,6 +419,7 @@ void init_esp_now() {
 
 void app_main(void){
     init_led_strip();
+    init_uart();
     init_esp_now();
     set_led_color(0, 32, 0, 1000, 0); // Solid green for ready state
     // Start dynamic discovery by sending a pairing request
