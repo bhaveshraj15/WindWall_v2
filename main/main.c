@@ -607,7 +607,6 @@ void app_main(void){
                     send_message(peers[i].mac, MSG_DATA, data, strlen(data) + 1);
                 }
             }
-            set_led_color(32, 32, 32, 500, 500); // White flash when sending data
         } else {
             // If no peers, try to reinitialize known peers
             ESP_LOGW(TAG, "No peers connected, reinitializing...");
