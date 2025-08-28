@@ -194,6 +194,51 @@ void send_message(const uint8_t *mac, message_type_t type, const void *data, siz
     }
 }
 
+// Add this to your peer management section
+static const char *known_macs[] = {
+    "F0:9E:9E:1E:4A:84",
+    "F0:9E:9E:1E:4A:E4",
+    "F0:9E:9E:21:E2:70",
+    // Add more MAC addresses as needed
+};
+static int known_mac_count = sizeof(known_macs) / sizeof(known_macs[0]);
+
+// Function to convert string MAC to uint8_t array
+bool parse_mac_address(const char *mac_str, uint8_t *mac) {
+    return sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+                  &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6;
+}
+
+// Initialize known peers during setup
+void init_known_peers() {
+    for (int i = 0; i < known_mac_count; i++) {
+        uint8_t mac[6];
+        if (parse_mac_address(known_macs[i], mac)) {
+            ESP_LOGI(TAG, "Adding known peer: %s", known_macs[i]);
+            add_peer(mac, true);  // Add with encryption
+        }
+    }
+}
+
+
+// Enhanced add_peer function with retry logic
+esp_err_t add_peer_with_retry(const uint8_t *mac, bool encrypt, int max_retries) {
+    esp_err_t ret = ESP_FAIL;
+    int retry_count = 0;
+    
+    while (ret != ESP_OK && retry_count < max_retries) {
+        ret = add_peer(mac, encrypt);
+        if (ret != ESP_OK) {
+            retry_count++;
+            ESP_LOGW(TAG, "Failed to add peer (attempt %d/%d), retrying...", 
+                    retry_count, max_retries);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+    }
+    
+    return ret;
+}
+
 // Handle received ESP-NOW data
 void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
     if (len < sizeof(esp_now_message_t)) {
@@ -391,6 +436,36 @@ void process_uart_command(char* command) {
         esp_read_mac(mac, ESP_MAC_WIFI_STA);
         printf("MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n",mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
+    else if (strstr(command, "addmac ")) {
+        // Add a MAC to known list: addmac <mac>
+        char* mac_str = command + 7;
+        uint8_t mac[6];
+        if (parse_mac_address(mac_str, mac)) {
+            // Check if already in known MACs
+            bool already_exists = false;
+            for (int i = 0; i < known_mac_count; i++) {
+                uint8_t known_mac[6];
+                if (parse_mac_address(known_macs[i], known_mac) && 
+                    memcmp(known_mac, mac, 6) == 0) {
+                    already_exists = true;
+                    break;
+                }
+            }
+            
+            if (!already_exists) {
+                // Add to known MACs (in a real implementation, you might want to save to NVS)
+                // For now, just add as a peer
+                add_peer(mac, true);
+                uart_write_bytes(UART_PORT_NUM, "MAC added and peer connection attempted\n", 
+                                strlen("MAC added and peer connection attempted\n"));
+            } else {
+                uart_write_bytes(UART_PORT_NUM, "MAC already known\n", 
+                                strlen("MAC already known\n"));
+            }
+        } else {
+            uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
+        }
+    }
     else if (strstr(command, "help")) {
         // Show help
         const char *help_text = 
@@ -401,6 +476,7 @@ void process_uart_command(char* command) {
             "  remove <MAC> - Remove a peer\n"
             "  me - Gives MAC address of Current Device\n"
             "  led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>] - Control LED (local or remote)\n"
+            "  addmac <MAC>- Add a MAC to known list\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
     }
@@ -498,6 +574,7 @@ void app_main(void){
     init_led_strip();
     init_uart();
     init_esp_now();
+    init_known_peers();
     set_led_color(0, 32, 0, 1000, 0); // Solid green for ready state
     // Start dynamic discovery by sending a pairing request
     uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -512,8 +589,13 @@ void app_main(void){
         for (int i = 0; i < peer_count; i++) {
             if (peers[i].paired && (xTaskGetTickCount() * portTICK_PERIOD_MS - last_peer_activity[i] > PEER_TIMEOUT_MS)) {
                 ESP_LOGW(TAG, "Peer timeout: " MACSTR, MAC2STR(peers[i].mac));
+                
+                // Instead of removing, try to re-establish connection
+                uint8_t mac[6];
+                memcpy(mac, peers[i].mac, 6);
                 remove_peer(peers[i].mac);
-                i--;
+                add_peer(mac, true);  // Try to reconnect
+                last_peer_activity[i] = xTaskGetTickCount() * portTICK_PERIOD_MS;
             }
         }
         if (peer_count > 0) {
@@ -526,14 +608,11 @@ void app_main(void){
                 }
             }
             set_led_color(32, 32, 32, 500, 500); // White flash when sending data
-        } else if (!discovery_complete) {
-                ESP_LOGW(TAG, "No paired peers, sending discovery request");
-                send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
-                discovery_complete = true; // Mark discovery as complete
-                set_led_color(32, 16, 0, 500, 500); // Orange flash for discovery
         } else {
-            // No peers and discovery already completed
-            set_led_color(32, 0, 0, 500, 500); // Red flash for no peers
+            // If no peers, try to reinitialize known peers
+            ESP_LOGW(TAG, "No peers connected, reinitializing...");
+            init_known_peers();
+            set_led_color(32, 16, 0, 500, 500); // Orange flash for discovery
         }
     }
 }
