@@ -14,6 +14,8 @@
 #include "esp_netif.h"
 #include "driver/uart.h"
 #include "esp_vfs_dev.h"
+#include "driver/ledc.h"
+#include "esp_timer.h"
 
 static const char *TAG = "WW_Comm"; //logging tag
 
@@ -22,6 +24,11 @@ static const char *TAG = "WW_Comm"; //logging tag
 #define UART_BAUD_RATE     115200
 #define UART_BUF_SIZE      1024
 #define UART_QUEUE_LEN     20
+// PWM LED configuration
+#define NUM_LEDS 6
+#define MAX_DUTY 8192 // 13-bit resolution for LEDC
+// LED pin configuration
+int ledPins[NUM_LEDS] = {2, 4, 5, 18, 19, 21};
 
 static bool discovery_complete = false;
 static uint32_t last_peer_activity[10] = {0};
@@ -77,7 +84,8 @@ typedef enum {
     MSG_PAIRING_REQUEST,
     MSG_PAIRING_RESPONSE,
     MSG_DATA,
-    MSG_LED_CONTROL
+    MSG_LED_CONTROL,
+    MSG_PWM_LED_CONTROL
 } message_type_t;
 
 // Message structure
@@ -172,6 +180,60 @@ void list_peers() {
     for (int i = 0; i < peer_count; i++) {
         log_mac(peers[i].paired ? "  Paired: " : "  Unpaired: ", peers[i].mac);
     }
+}
+
+void init_pwm_leds() {
+    // Configure 3 timers (for 3 columns)
+    for (int timer = 0; timer < 3; timer++) {
+        ledc_timer_config_t ledc_timer = {
+            .speed_mode       = LEDC_LOW_SPEED_MODE,
+            .timer_num        = (ledc_timer_t)timer,
+            .duty_resolution  = LEDC_TIMER_13_BIT,
+            .freq_hz          = 5000,
+            .clk_cfg          = LEDC_AUTO_CLK
+        };
+        ledc_timer_config(&ledc_timer);
+    }
+
+    // Configure 6 unique channels, 2 LEDs per timer/column
+    for (int i = 0; i < NUM_LEDS; i++) {
+        int column = i % 3; // column: 0, 1, 2
+
+        ledc_channel_config_t ledc_channel = {
+            .channel    = (ledc_channel_t)i,
+            .duty       = 0,
+            .gpio_num   = ledPins[i],
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .hpoint     = 0,
+            .timer_sel  = (ledc_timer_t)column
+        };
+
+        ledc_channel_config(&ledc_channel);
+    }
+}
+
+void set_brightness(int index, int percent) {
+    if (index < 0 || index >= NUM_LEDS) return;
+
+    uint32_t duty = (percent * MAX_DUTY) / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)index, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)index);
+
+    long now = esp_timer_get_time();
+    ESP_LOGI(TAG, "LED[%d] -> %d%% (duty=%ld) at %ld us", index, percent, duty, now);
+}
+void pwm_delay_task(void *pvParameters) {
+    int delay_ms = (int)(intptr_t)pvParameters;
+    
+    vTaskDelay(delay_ms / portTICK_PERIOD_MS);
+    
+    // Turn off all LEDs
+    for (int j = 0; j < NUM_LEDS; j++) {
+        set_brightness(j, 0);
+    }
+    
+    ESP_LOGI(TAG, "PWM LEDs turned off after %d ms", delay_ms);
+    vTaskDelete(NULL);
 }
 
 // Send ESP-NOW message
@@ -298,6 +360,36 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
                 set_led_color(r, g, b, timeout_ms, blank_ms);
             } else {
                 ESP_LOGE(TAG, "Invalid LED control format");
+            }
+            break;
+        case MSG_PWM_LED_CONTROL:
+            ESP_LOGI(TAG, "PWM LED control message received");
+            // Parse the PWM LED control parameters
+            int brightness[NUM_LEDS];
+            int delay_ms;
+            
+            if (sscanf((char *)msg->data, "%d,%d,%d,%d,%d,%d,%d", 
+                    &brightness[0], &brightness[1], &brightness[2],
+                    &brightness[3], &brightness[4], &brightness[5], &delay_ms) == NUM_LEDS + 1) {
+                
+                ESP_LOGI(TAG, "Setting PWM LEDs: %d,%d,%d,%d,%d,%d with delay %dms", 
+                        brightness[0], brightness[1], brightness[2],
+                        brightness[3], brightness[4], brightness[5], delay_ms);
+                
+                // Set all LEDs to specified brightness
+                for (int j = 0; j < NUM_LEDS; j++) {
+                    set_brightness(j, brightness[j]);
+                }
+                
+                if (delay_ms > 0) {
+                    // Create task to handle delayed turn-off
+                    xTaskCreate(pwm_delay_task, "pwm_delay", 2048, 
+                            (void*)(intptr_t)delay_ms, 5, NULL);
+                }
+            } else {
+                ESP_LOGE(TAG, "Invalid PWM LED control format");
+                char error_msg[] = "Invalid PWM LED control format";
+                send_message(mac, MSG_DATA, error_msg, strlen(error_msg) + 1);
             }
             break;
         default:
@@ -466,6 +558,69 @@ void process_uart_command(char* command) {
             uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
         }
     }
+    else if (strstr(command, "pwmled ")) {
+        // PWM LED control: pwmled <b1> <b2> <b3> <b4> <b5> <b6> <delay_ms> [<MAC>]
+        int brightness[NUM_LEDS] = {0};
+        int delay_ms = 0;
+        char mac_str[20] = {0};
+        
+        char *token = strtok(command + 7, " \t\n");
+        int i = 0;
+        int param_count = 0;
+        
+        // Parse all parameters
+        while (token != NULL && param_count <= NUM_LEDS + 1) {
+            if (param_count < NUM_LEDS) {
+                brightness[param_count] = atoi(token);
+            } else if (param_count == NUM_LEDS) {
+                delay_ms = atoi(token);
+            } else {
+                strncpy(mac_str, token, sizeof(mac_str) - 1);
+            }
+            param_count++;
+            token = strtok(NULL, " \t\n");
+        }
+        
+        // Validate input
+        if (param_count < NUM_LEDS + 1) {
+            uart_write_bytes(UART_PORT_NUM, "Invalid PWM LED command format\n", 
+                            strlen("Invalid PWM LED command format\n"));
+            return;
+        }
+        
+        // Format the PWM LED control data
+        char pwm_data[50];
+        snprintf(pwm_data, sizeof(pwm_data), "%d,%d,%d,%d,%d,%d,%d",
+                brightness[0], brightness[1], brightness[2],
+                brightness[3], brightness[4], brightness[5], delay_ms);
+        
+        if (strlen(mac_str) > 0) {
+            // Send to specific MAC address
+            uint8_t mac[6];
+            if (parse_mac_address(mac_str, mac)) {
+                send_message(mac, MSG_PWM_LED_CONTROL, pwm_data, strlen(pwm_data) + 1);
+                uart_write_bytes(UART_PORT_NUM, "PWM LED command sent to remote device\n", 
+                                strlen("PWM LED command sent to remote device\n"));
+            } else {
+                uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", 
+                                strlen("Invalid MAC format\n"));
+            }
+        } else {
+            // Execute locally
+            for (int j = 0; j < NUM_LEDS; j++) {
+                set_brightness(j, brightness[j]);
+            }
+            
+            if (delay_ms > 0) {
+                // Create task to handle delayed turn-off
+                xTaskCreate(pwm_delay_task, "pwm_delay", 2048, 
+                        (void*)(intptr_t)delay_ms, 5, NULL);
+            }
+            
+            uart_write_bytes(UART_PORT_NUM, "PWM LEDs set locally\n", 
+                            strlen("PWM LEDs set locally\n"));
+        }
+    }
     else if (strstr(command, "help")) {
         // Show help
         const char *help_text = 
@@ -476,6 +631,7 @@ void process_uart_command(char* command) {
             "  remove <MAC> - Remove a peer\n"
             "  me - Gives MAC address of Current Device\n"
             "  led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>] - Control LED (local or remote)\n"
+            "  pwmled <b1> <b2> <b3> <b4> <b5> <b6> <delay_ms> [<MAC>] - Control PWM LEDs (local or remote)\n"
             "  addmac <MAC>- Add a MAC to known list\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
