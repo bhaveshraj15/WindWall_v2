@@ -212,17 +212,29 @@ void init_pwm_leds() {
     }
 }
 
+static int pwm_delays[NUM_LEDS] = {0};
+static TickType_t pwm_off_times[NUM_LEDS] = {0};
+
 void set_brightness(int index, int percent) {
     if (index < 0 || index >= NUM_LEDS) return;
+    percent = (percent < 0) ? 0 : (percent > 100) ? 100 : percent; // Clamp percentage between 0 and 100
 
     uint32_t duty = (percent * MAX_DUTY) / 100;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)index, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)index);
 
+    // If percent is 0, clear the delay
+    if (percent == 0) {
+        pwm_delays[index] = 0;
+        pwm_off_times[index] = 0;
+    }
     long now = esp_timer_get_time();
     ESP_LOGI(TAG, "LED[%d] -> %d%% (duty=%ld) at %ld us", index, percent, duty, now);
 }
 void pwm_delay_task(void *pvParameters) {
+    // Check stack watermark at the beginning
+    UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "pwm_delay_task stack high water mark: %d", uxHighWaterMark);
     int delay_ms = (int)(intptr_t)pvParameters;
     
     vTaskDelay(delay_ms / portTICK_PERIOD_MS);
@@ -233,7 +245,26 @@ void pwm_delay_task(void *pvParameters) {
     }
     
     ESP_LOGI(TAG, "PWM LEDs turned off after %d ms", delay_ms);
+    // Check stack watermark at the end
+    uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "pwm_delay_task stack high water mark at end: %d", uxHighWaterMark);
     vTaskDelete(NULL);
+}
+void pwm_manager_task(void *pvParameters) {
+    while (1) {
+        TickType_t current_time = xTaskGetTickCount();
+        
+        for (int i = 0; i < NUM_LEDS; i++) {
+            if (pwm_delays[i] > 0 && pwm_off_times[i] > 0 && 
+                current_time >= pwm_off_times[i]) {
+                set_brightness(i, 0);
+                pwm_delays[i] = 0;
+                pwm_off_times[i] = 0;
+            }
+        }
+        
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Check every 100ms
+    }
 }
 
 // Send ESP-NOW message
@@ -379,16 +410,16 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
                 // Set all LEDs to specified brightness
                 for (int j = 0; j < NUM_LEDS; j++) {
                     set_brightness(j, brightness[j]);
-                }
                 
-                if (delay_ms > 0) {
-                    // Create task to handle delayed turn-off
-                    xTaskCreate(pwm_delay_task, "pwm_delay", 2048, 
-                            (void*)(intptr_t)delay_ms, 5, NULL);
+                    if (delay_ms > 0) {
+                        pwm_delays[j] = delay_ms;
+                        pwm_off_times[j] = xTaskGetTickCount() + (delay_ms / portTICK_PERIOD_MS);
+                    }
                 }
             } else {
-                ESP_LOGE(TAG, "Invalid PWM LED control format");
-                char error_msg[] = "Invalid PWM LED control format";
+                ESP_LOGE(TAG, "Failed to parse PWM LED control data: %s", (char *)msg->data);
+                char error_msg[50];
+                //snprintf(error_msg, sizeof(error_msg), "PWM parse error: %s", (char *)msg->data);
                 send_message(mac, MSG_DATA, error_msg, strlen(error_msg) + 1);
             }
             break;
@@ -558,13 +589,14 @@ void process_uart_command(char* command) {
             uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
         }
     }
-    else if (strstr(command, "pwmled ")) {
+    else if (strstr(command, "pwm ")) {
+        ESP_LOGI(TAG, "Processing PWM LED command: %s", command);
         // PWM LED control: pwmled <b1> <b2> <b3> <b4> <b5> <b6> <delay_ms> [<MAC>]
         int brightness[NUM_LEDS] = {0};
         int delay_ms = 0;
         char mac_str[20] = {0};
         
-        char *token = strtok(command + 7, " \t\n");
+        char *token = strtok(command + 4, " \t\n");
         int i = 0;
         int param_count = 0;
         
@@ -572,10 +604,13 @@ void process_uart_command(char* command) {
         while (token != NULL && param_count <= NUM_LEDS + 1) {
             if (param_count < NUM_LEDS) {
                 brightness[param_count] = atoi(token);
+                ESP_LOGI(TAG, "Brightness[%d] = %d", param_count, brightness[param_count]);
             } else if (param_count == NUM_LEDS) {
                 delay_ms = atoi(token);
+                ESP_LOGI(TAG, "Delay_ms = %d", delay_ms);
             } else {
                 strncpy(mac_str, token, sizeof(mac_str) - 1);
+                ESP_LOGI(TAG, "MAC = %s", mac_str);
             }
             param_count++;
             token = strtok(NULL, " \t\n");
@@ -583,6 +618,8 @@ void process_uart_command(char* command) {
         
         // Validate input
         if (param_count < NUM_LEDS + 1) {
+            ESP_LOGE(TAG, "Invalid PWM LED command format. Got %d params, expected %d", 
+                param_count, NUM_LEDS + 1);
             uart_write_bytes(UART_PORT_NUM, "Invalid PWM LED command format\n", 
                             strlen("Invalid PWM LED command format\n"));
             return;
@@ -613,13 +650,21 @@ void process_uart_command(char* command) {
             
             if (delay_ms > 0) {
                 // Create task to handle delayed turn-off
-                xTaskCreate(pwm_delay_task, "pwm_delay", 2048, 
+                xTaskCreate(pwm_delay_task, "pwm_delay", 4096, 
                         (void*)(intptr_t)delay_ms, 5, NULL);
             }
             
             uart_write_bytes(UART_PORT_NUM, "PWM LEDs set locally\n", 
                             strlen("PWM LEDs set locally\n"));
         }
+    }
+    else if (strstr(command, "testpwm")) {
+        // Simple test command
+        for (int i = 0; i < NUM_LEDS; i++) {
+            set_brightness(i, 50);
+        }
+        uart_write_bytes(UART_PORT_NUM, "All LEDs set to 50%\n", 
+                        strlen("All LEDs set to 50%\n"));
     }
     else if (strstr(command, "help")) {
         // Show help
@@ -631,7 +676,8 @@ void process_uart_command(char* command) {
             "  remove <MAC> - Remove a peer\n"
             "  me - Gives MAC address of Current Device\n"
             "  led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>] - Control LED (local or remote)\n"
-            "  pwmled <b1> <b2> <b3> <b4> <b5> <b6> <delay_ms> [<MAC>] - Control PWM LEDs (local or remote)\n"
+            "  pwm <b1> <b2> <b3> <b4> <b5> <b6> <delay_ms> [<MAC>] - Control PWM LEDs (local or remote)\n"
+            "  testpwm - test the pwm-leds"
             "  addmac <MAC>- Add a MAC to known list\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
@@ -693,7 +739,7 @@ void init_uart() {
     esp_vfs_dev_uart_use_driver(UART_PORT_NUM);
     
     // Create UART task
-    xTaskCreate(uart_task, "uart_task", 4096, NULL, 10, NULL);
+    xTaskCreate(uart_task, "uart_task", 8192, NULL, 10, NULL);
     
     // Print welcome message
     const char *welcome = "\nESP-NOW Communication System\nType 'help' for available commands\n\n";
@@ -726,16 +772,43 @@ void init_esp_now() {
     ESP_LOGI(TAG, "ESP-NOW initialized successfully");
 }
 
+void test_leds() {
+    ESP_LOGI(TAG, "Testing all LEDs");
+    
+    // Test each LED individually
+    for (int i = 0; i < NUM_LEDS; i++) {
+        ESP_LOGI(TAG, "Testing LED %d on GPIO %d", i, ledPins[i]);
+        set_brightness(i, 100);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        set_brightness(i, 0);
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+    
+    // Test all LEDs together
+    ESP_LOGI(TAG, "Testing all LEDs together");
+    for (int i = 0; i < NUM_LEDS; i++) {
+        set_brightness(i, 50);
+    }
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    for (int i = 0; i < NUM_LEDS; i++) {
+        set_brightness(i, 0);
+    }
+    
+    ESP_LOGI(TAG, "LED test complete");
+}
+
 void app_main(void){
     init_led_strip();
+    init_pwm_leds();
     init_uart();
+    test_leds();
     init_esp_now();
     init_known_peers();
     set_led_color(0, 32, 0, 1000, 0); // Solid green for ready state
     // Start dynamic discovery by sending a pairing request
     uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
-
+    xTaskCreate(pwm_manager_task, "pwm_manager", 4096, NULL, 5, NULL);
     // Main loop: send data periodically
     int counter = 0;
 
