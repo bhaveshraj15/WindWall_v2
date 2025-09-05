@@ -8,3 +8,5 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(led_strip)
 
 set(EXTRA_COMPONENT_DIRS components)
+
+spiffs_create_partition_image(storage spiffs FLASH_IN_PROJECT)

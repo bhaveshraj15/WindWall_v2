@@ -16,6 +16,7 @@
 #include "esp_vfs_dev.h"
 #include "driver/ledc.h"
 #include "esp_timer.h"
+#include "esp_spiffs.h"
 
 static const char *TAG = "WW_Comm"; //logging tag
 
@@ -45,35 +46,6 @@ static QueueHandle_t uart_queue; // Global variables for UART
 #define BLINK_GPIO 48
 
 led_strip_handle_t led_strip;
-
-void init_led_strip(){
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = BLINK_GPIO,
-        .max_leds = 1
-    };
-    led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000, // 10MHz
-        .flags.with_dma = false,
-    };
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    ESP_ERROR_CHECK(led_strip_clear(led_strip)); // Clear the strip initially
-} 
-
-void set_led_color(int r, int g, int b, int timeout_ms, int blank_ms) {
-    // Validate parameters
-    r = (r < 0) ? 0 : (r > 255) ? 255 : r;
-    g = (g < 0) ? 0 : (g > 255) ? 255 : g;
-    b = (b < 0) ? 0 : (b > 255) ? 255 : b;
-    timeout_ms = (timeout_ms < 0) ? 0 : timeout_ms;
-    blank_ms = (blank_ms < 0) ? 0 : blank_ms;
-
-    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, r, g, b));
-    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-    vTaskDelay(pdMS_TO_TICKS(timeout_ms));
-    ESP_ERROR_CHECK(led_strip_clear(led_strip));
-    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
-    vTaskDelay(pdMS_TO_TICKS(blank_ms));
-}
 
 // PMK (Primary Master Key) and LMK (Local Master Key) for encryption
 static const char *PMK = "0123456789abcdef"; // 16-byte PMK
@@ -107,6 +79,51 @@ typedef struct {
 // List of peers (max 10 for example)
 static peer_device_t peers[10];
 static int peer_count = 0;
+
+// Function declarations
+void execute_command(char *command, bool uart_feedback);
+void process_command_file(const char *file_path);
+void process_uart_command(char* command);
+bool parse_mac_address(const char *mac_str, uint8_t *mac);
+void init_known_peers(void);
+void set_led_color(int r, int g, int b, int timeout_ms, int blank_ms);
+void set_brightness(int index, int percent);
+void send_message(const uint8_t *mac, message_type_t type, const void *data, size_t len);
+esp_err_t add_peer(const uint8_t *mac, bool encrypt);
+esp_err_t remove_peer(const uint8_t *mac);
+void list_peers(void);
+void log_mac(const char *prefix, const uint8_t *mac);
+void init_pwm_leds(void);
+void init_led_strip(void);
+
+void init_led_strip(){
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = BLINK_GPIO,
+        .max_leds = 1
+    };
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz
+        .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    ESP_ERROR_CHECK(led_strip_clear(led_strip)); // Clear the strip initially
+} 
+
+void set_led_color(int r, int g, int b, int timeout_ms, int blank_ms) {
+    // Validate parameters
+    r = (r < 0) ? 0 : (r > 255) ? 255 : r;
+    g = (g < 0) ? 0 : (g > 255) ? 255 : g;
+    b = (b < 0) ? 0 : (b > 255) ? 255 : b;
+    timeout_ms = (timeout_ms < 0) ? 0 : timeout_ms;
+    blank_ms = (blank_ms < 0) ? 0 : blank_ms;
+
+    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, r, g, b));
+    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+    vTaskDelay(pdMS_TO_TICKS(timeout_ms));
+    ESP_ERROR_CHECK(led_strip_clear(led_strip));
+    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
+    vTaskDelay(pdMS_TO_TICKS(blank_ms));
+}
 
 // Function to log MAC address
 void log_mac(const char *prefix, const uint8_t *mac) {
@@ -443,33 +460,32 @@ void esp_now_send_cb(const uint8_t *mac, esp_now_send_status_t status) {
     log_mac("Send status:", mac);
     ESP_LOGI(TAG, "Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
-// Process UART commands
-void process_uart_command(char* command) {
+// Function to execute a command
+void execute_command(char* command, bool uart_feedback) {
     // Remove newline characters
     char *newline = strchr(command, '\n');
     if (newline) *newline = '\0';
     newline = strchr(command, '\r');
     if (newline) *newline = '\0';
-    
-    ESP_LOGI(TAG, "UART Command: %s", command);
-    
+        
     if (strstr(command, "discover")) {
         // Manual discovery trigger
         discovery_complete = false;
         uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
         send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
-        uart_write_bytes(UART_PORT_NUM, "Discovery initiated\n", strlen("Discovery initiated\n"));
+        if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Discovery initiated\n", strlen("Discovery initiated\n"));
     } 
     else if (strstr(command, "list")) {
-        // List all peers
-        char response[100];
-        snprintf(response, sizeof(response), "Registered peers: %d\n", peer_count);
-        uart_write_bytes(UART_PORT_NUM, response, strlen(response));
-        
-        for (int i = 0; i < peer_count; i++) {
-            snprintf(response, sizeof(response), "Peer %d: " MACSTR " %s\n", 
-                    i, MAC2STR(peers[i].mac), peers[i].paired ? "Paired" : "Unpaired");
+        if (uart_feedback){
+            char response[100];
+            snprintf(response, sizeof(response), "Registered peers: %d\n", peer_count);
             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+            
+            for (int i = 0; i < peer_count; i++) {
+                snprintf(response, sizeof(response), "Peer %d: " MACSTR " %s\n", 
+                        i, MAC2STR(peers[i].mac), peers[i].paired ? "Paired" : "Unpaired");
+                uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+            }
         }
     }
     else if (strstr(command, "send ")) {
@@ -482,13 +498,13 @@ void process_uart_command(char* command) {
             if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
                       &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
                 send_message(mac, MSG_DATA, message, strlen(message) + 1);
-                uart_write_bytes(UART_PORT_NUM, "Message sent\n", strlen("Message sent\n"));
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Message sent\n", strlen("Message sent\n"));
             } else {
-                uart_write_bytes(UART_PORT_NUM, "Invalid MAC format. Use AA:BB:CC:DD:EE:FF\n", 
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format. Use AA:BB:CC:DD:EE:FF\n", 
                                 strlen("Invalid MAC format. Use AA:BB:CC:DD:EE:FF\n"));
             }
         } else {
-            uart_write_bytes(UART_PORT_NUM, "Usage: send <MAC> <message>\n", 
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Usage: send <MAC> <message>\n", 
                             strlen("Usage: send <MAC> <message>\n"));
         }
     }
@@ -499,9 +515,9 @@ void process_uart_command(char* command) {
         if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
                   &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
             remove_peer(mac);
-            uart_write_bytes(UART_PORT_NUM, "Peer removed\n", strlen("Peer removed\n"));
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Peer removed\n", strlen("Peer removed\n"));
         } else {
-            uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
         }
     }
     else if (strstr(command, "led ")) {
@@ -525,10 +541,10 @@ void process_uart_command(char* command) {
                 if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
                           &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
                     send_message(mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
-                    uart_write_bytes(UART_PORT_NUM, "LED command sent to specific device\n", 
+                    if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "LED command sent to specific device\n", 
                                     strlen("LED command sent to specific device\n"));
                 } else {
-                    uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
+                    if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
                 }
             } else {
                 // Set locally and broadcast to all peers
@@ -540,11 +556,11 @@ void process_uart_command(char* command) {
                         send_message(peers[i].mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
                     }
                 }
-                uart_write_bytes(UART_PORT_NUM, "LED command set locally and sent to all peers\n", 
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "LED command set locally and sent to all peers\n", 
                                 strlen("LED command set locally and sent to all peers\n"));
             }
         } else {
-            uart_write_bytes(UART_PORT_NUM, 
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
                             "Usage: led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>]\n"
                             "Example: led 255 0 0 1000 500\n"
                             "Example: led 0 255 0 500 200 AA:BB:CC:DD:EE:FF\n", 
@@ -557,7 +573,7 @@ void process_uart_command(char* command) {
         // Get MAC address of the ESP32
         uint8_t mac[6];
         esp_read_mac(mac, ESP_MAC_WIFI_STA);
-        printf("MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n",mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        if (uart_feedback) printf("MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n",mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
     else if (strstr(command, "addmac ")) {
         // Add a MAC to known list: addmac <mac>
@@ -579,14 +595,14 @@ void process_uart_command(char* command) {
                 // Add to known MACs (in a real implementation, you might want to save to NVS)
                 // For now, just add as a peer
                 add_peer(mac, true);
-                uart_write_bytes(UART_PORT_NUM, "MAC added and peer connection attempted\n", 
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "MAC added and peer connection attempted\n", 
                                 strlen("MAC added and peer connection attempted\n"));
             } else {
-                uart_write_bytes(UART_PORT_NUM, "MAC already known\n", 
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "MAC already known\n", 
                                 strlen("MAC already known\n"));
             }
         } else {
-            uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
         }
     }
     else if (strstr(command, "pwm ")) {
@@ -618,13 +634,12 @@ void process_uart_command(char* command) {
         
         // Validate input
         if (param_count < NUM_LEDS + 1) {
-            ESP_LOGE(TAG, "Invalid PWM LED command format. Got %d params, expected %d", 
-                param_count, NUM_LEDS + 1);
+            if (uart_feedback) {
             uart_write_bytes(UART_PORT_NUM, "Invalid PWM LED command format\n", 
                             strlen("Invalid PWM LED command format\n"));
             return;
+            }
         }
-        
         // Format the PWM LED control data
         char pwm_data[50];
         snprintf(pwm_data, sizeof(pwm_data), "%d,%d,%d,%d,%d,%d,%d",
@@ -636,10 +651,10 @@ void process_uart_command(char* command) {
             uint8_t mac[6];
             if (parse_mac_address(mac_str, mac)) {
                 send_message(mac, MSG_PWM_LED_CONTROL, pwm_data, strlen(pwm_data) + 1);
-                uart_write_bytes(UART_PORT_NUM, "PWM LED command sent to remote device\n", 
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "PWM LED command sent to remote device\n", 
                                 strlen("PWM LED command sent to remote device\n"));
             } else {
-                uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", 
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", 
                                 strlen("Invalid MAC format\n"));
             }
         } else {
@@ -654,7 +669,7 @@ void process_uart_command(char* command) {
                         (void*)(intptr_t)delay_ms, 5, NULL);
             }
             
-            uart_write_bytes(UART_PORT_NUM, "PWM LEDs set locally\n", 
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "PWM LEDs set locally\n", 
                             strlen("PWM LEDs set locally\n"));
         }
     }
@@ -663,8 +678,12 @@ void process_uart_command(char* command) {
         for (int i = 0; i < NUM_LEDS; i++) {
             set_brightness(i, 50);
         }
-        uart_write_bytes(UART_PORT_NUM, "All LEDs set to 50%\n", 
+        if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "All LEDs set to 50%\n", 
                         strlen("All LEDs set to 50%\n"));
+    }
+    else if (strstr(command, "execute ")) {
+        char *file_path = command + 8;  // Skip "execute "
+        process_command_file(file_path);  // Function to process the file
     }
     else if (strstr(command, "help")) {
         // Show help
@@ -679,13 +698,47 @@ void process_uart_command(char* command) {
             "  pwm <b1> <b2> <b3> <b4> <b5> <b6> <delay_ms> [<MAC>] - Control PWM LEDs (local or remote)\n"
             "  testpwm - test the pwm-leds"
             "  addmac <MAC>- Add a MAC to known list\n"
+            "  execute <file_path> - Execute a COMMANDs file </spiffs/commands.txt>\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
     }
     else {
-        uart_write_bytes(UART_PORT_NUM, "Unknown command. Type 'help' for available commands.\n", 
+        if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Unknown command. Type 'help' for available commands.\n", 
                         strlen("Unknown command. Type 'help' for available commands.\n"));
     }
+}
+// Process UART commands
+void process_uart_command(char* command) {
+   execute_command(command, true); 
+}
+// opens the file, reads each line, and executes the commands silently
+void process_command_file(const char *file_path) {
+    FILE *file = fopen(file_path, "r");
+    if (file == NULL) {
+        ESP_LOGE(TAG, "Failed to open file: %s", file_path);
+        uart_write_bytes(UART_PORT_NUM, "Error: File not found\n", strlen("Error: File not found\n"));
+        return;
+    }
+
+    char line[100];
+    while (fgets(line, sizeof(line), file) != NULL) {
+        // Remove newline characters
+        char *newline = strchr(line, '\n');
+        if (newline) *newline = '\0';
+        newline = strchr(line, '\r');
+        if (newline) *newline = '\0';
+
+        // Skip empty lines or comments (lines starting with #)
+        if (strlen(line) == 0 || line[0] == '#') {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Executing command: %s", line);
+        execute_command(line, false);  // Execute without UART feedback
+    }
+
+    fclose(file);
+    uart_write_bytes(UART_PORT_NUM, "File execution completed\n", strlen("File execution completed\n"));
 }
 
 // UART task function
@@ -797,7 +850,23 @@ void test_leds() {
     ESP_LOGI(TAG, "LED test complete");
 }
 
+// Initialize SPIFFS
+void init_sniffs(){
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SPIFFS (%s)", esp_err_to_name(ret));
+        return;
+    }
+}
+
 void app_main(void){
+    init_sniffs();
     init_led_strip();
     init_pwm_leds();
     init_uart();
