@@ -57,8 +57,18 @@ typedef enum {
     MSG_PAIRING_RESPONSE,
     MSG_DATA,
     MSG_LED_CONTROL,
-    MSG_PWM_LED_CONTROL
+    MSG_PWM_LED_CONTROL,
+    MSG_FILE_TRANSFER  
 } message_type_t;
+
+// File transfer structure
+typedef struct __attribute__((packed)) {
+    char filename[20];
+    uint32_t file_size;
+    uint32_t chunk_index;
+    uint32_t total_chunks;
+    uint8_t data[200];  // Data chunk
+} file_chunk_t;
 
 // Message structure
 typedef struct __attribute__((packed)) {
@@ -95,6 +105,8 @@ void list_peers(void);
 void log_mac(const char *prefix, const uint8_t *mac);
 void init_pwm_leds(void);
 void init_led_strip(void);
+void send_file(const uint8_t* mac, const char* filename);
+void receive_file(file_chunk_t* chunk);
 
 void init_led_strip(){
     led_strip_config_t strip_config = {
@@ -349,6 +361,105 @@ esp_err_t add_peer_with_retry(const uint8_t *mac, bool encrypt, int max_retries)
     return ret;
 }
 
+// Send a file via ESP-NOW
+void send_file(const uint8_t* mac, const char* filename) {
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        ESP_LOGE(TAG, "Failed to open file: %s", filename);
+        return;
+    }
+    
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    uint32_t file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    // Calculate total chunks
+    file_chunk_t chunk;
+    uint32_t total_chunks = (file_size + sizeof(chunk.data) - 1) / sizeof(chunk.data);
+    uint32_t chunk_index = 0;
+    uint8_t buffer[sizeof(chunk.data)];
+    
+    ESP_LOGI(TAG, "Sending file: %s, size: %d bytes, chunks: %d", filename, file_size, total_chunks);
+    
+    while (!feof(file)) {
+        size_t bytes_read = fread(buffer, 1, sizeof(buffer), file);
+        if (bytes_read == 0) break;
+        
+        file_chunk_t chunk;
+        strncpy(chunk.filename, filename, sizeof(chunk.filename)-1);
+        chunk.filename[sizeof(chunk.filename)-1] = '\0';
+        chunk.file_size = file_size;
+        chunk.chunk_index = chunk_index;
+        chunk.total_chunks = total_chunks;
+        memcpy(chunk.data, buffer, bytes_read);
+        
+        // Send chunk
+        send_message(mac, MSG_FILE_TRANSFER, &chunk, sizeof(chunk));
+        
+        chunk_index++;
+        vTaskDelay(10 / portTICK_PERIOD_MS);  // Small delay to prevent flooding
+    }
+    
+    fclose(file);
+    ESP_LOGI(TAG, "File sent successfully: %s", filename);
+}
+
+// Receive file via ESP-NOW
+void receive_file(file_chunk_t* chunk) {
+    static FILE* current_file = NULL;
+    static uint32_t expected_chunk = 0;
+    static char current_filename[20] = {0};
+    
+    // New file or different file
+    if (strcmp(current_filename, chunk->filename) != 0) {
+        if (current_file) fclose(current_file);
+        
+        strncpy(current_filename, chunk->filename, sizeof(current_filename)-1);
+        current_filename[sizeof(current_filename)-1] = '\0';
+        
+        current_file = fopen(chunk->filename, "wb");
+        if (!current_file) {
+            ESP_LOGE(TAG, "Failed to create file: %s", chunk->filename);
+            return;
+        }
+        
+        expected_chunk = 0;
+        ESP_LOGI(TAG, "Receiving new file: %s, size: %d bytes", chunk->filename, chunk->file_size);
+    }
+    
+    // Check if this is the expected chunk
+    if (chunk->chunk_index != expected_chunk) {
+        ESP_LOGW(TAG, "Out-of-order chunk: expected %d, got %d", expected_chunk, chunk->chunk_index);
+        // We could implement buffering, but for simplicity, we'll just skip
+        return;
+    }
+    
+    // Write chunk to file
+    size_t bytes_to_write = sizeof(chunk->data);
+    if (chunk->chunk_index == chunk->total_chunks - 1) {
+        // Last chunk might be partial
+        bytes_to_write = chunk->file_size - (chunk->chunk_index * sizeof(chunk->data));
+    }
+    
+    fwrite(chunk->data, 1, bytes_to_write, current_file);
+    expected_chunk++;
+    
+    // Check if file is complete
+    if (expected_chunk >= chunk->total_chunks) {
+        fclose(current_file);
+        current_file = NULL;
+        current_filename[0] = '\0';
+        ESP_LOGI(TAG, "File received completely: %s", chunk->filename);
+        
+        // If this is commands.txt, execute it
+        if (strcmp(chunk->filename, "/spiffs/commands.txt") == 0) {
+            ESP_LOGI(TAG, "Executing received commands file");
+            process_command_file("/spiffs/commands.txt");
+        }
+    }
+}
+
 // Handle received ESP-NOW data
 void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
     if (len < sizeof(esp_now_message_t)) {
@@ -439,6 +550,10 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
                 //snprintf(error_msg, sizeof(error_msg), "PWM parse error: %s", (char *)msg->data);
                 send_message(mac, MSG_DATA, error_msg, strlen(error_msg) + 1);
             }
+            break;
+        case MSG_FILE_TRANSFER:
+            ESP_LOGI(TAG, "File transfer message received");
+            receive_file((file_chunk_t *)msg->data);
             break;
         default:
             ESP_LOGE(TAG, "Unknown message type: %d", msg->msg_type);
@@ -715,6 +830,27 @@ void execute_command(char* command, bool uart_feedback) {
                             strlen("End command only supported in command files\n"));
         }
     }
+    else if (strstr(command, "sendfile ")) {
+        // sendfile <mac> <filename>
+        char* mac_str = strtok(command + 9, " ");
+        char* filename = strtok(NULL, " ");
+        
+        if (mac_str && filename) {
+            uint8_t mac[6];
+            if (parse_mac_address(mac_str, mac)) {
+                send_file(mac, filename);
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "File transfer started\n", 
+                                                strlen("File transfer started\n"));
+            } else {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", 
+                                                strlen("Invalid MAC format\n"));
+            }
+        } else {
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                                            "Usage: sendfile <MAC> <filename>\n", 
+                                            strlen("Usage: sendfile <MAC> <filename>\n"));
+        }
+    }
     else if (strstr(command, "help")) {
         // Show help
         const char *help_text = 
@@ -732,6 +868,7 @@ void execute_command(char* command, bool uart_feedback) {
             "  hold <time_ms> - Pause execution for specified milliseconds\n"
             "  loop <count> - Start a loop block (must be followed by 'end')\n"
             "  end - End a loop block\n"
+            "  sendfile <MAC> <filename> - Send a file to a device\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
     }
