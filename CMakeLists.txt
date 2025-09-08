@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.5)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(led_strip)
+project(wind_wall)
 
 set(EXTRA_COMPONENT_DIRS components)
 
