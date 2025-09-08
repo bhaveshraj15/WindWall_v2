@@ -744,11 +744,16 @@ void execute_command(char* command, bool uart_feedback) {
         }
     }
     else if (strstr(command, "upload ")) {
-        // Upload command: upload <filename> <content>
-        char* filename = strtok(command + 7, " ");
-        char* content = strtok(NULL, "\0");  // Get the rest of the command
-        
-        if (filename && content) {
+        char* first_space = strchr(command + 7, ' ');
+        if (first_space) {
+            // Extract filename (between "upload" and next space)
+            int filename_len = first_space - (command + 7);
+            char filename[filename_len + 1];
+            strncpy(filename, command + 7, filename_len);
+            filename[filename_len] = '\0';
+            
+            // The rest is the content
+            char* content = first_space + 1;
             FILE* f = fopen(filename, "w");
             if (f) {
                 fputs(content, f);
