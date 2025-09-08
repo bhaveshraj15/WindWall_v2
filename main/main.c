@@ -57,7 +57,8 @@ typedef enum {
     MSG_PAIRING_RESPONSE,
     MSG_DATA,
     MSG_LED_CONTROL,
-    MSG_PWM_LED_CONTROL
+    MSG_PWM_LED_CONTROL,
+    MSG_FILE_TRANSFER
 } message_type_t;
 
 // Message structure
@@ -67,6 +68,14 @@ typedef struct __attribute__((packed)) {
     uint8_t src_mac[6];
     uint8_t data[236]; // Flexible data field
 } esp_now_message_t;
+
+// File transfer structure
+typedef struct __attribute__((packed)) {
+    char filename[20];
+    uint32_t file_size;
+    uint32_t chunk_index;
+    uint8_t data[200];  // Data chunk
+} file_chunk_t;
 
 static uint32_t sequence_counter = 0;
 
@@ -440,6 +449,25 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
                 send_message(mac, MSG_DATA, error_msg, strlen(error_msg) + 1);
             }
             break;
+        case MSG_FILE_TRANSFER:
+            ESP_LOGI(TAG, "File transfer message received");
+            file_chunk_t *chunk = (file_chunk_t *)msg->data;
+            
+            // Open file for writing (first chunk) or appending (subsequent chunks)
+            FILE* f = fopen(chunk->filename, chunk->chunk_index == 0 ? "w" : "a");
+            if (f) {
+                fwrite(chunk->data, 1, strlen((char*)chunk->data), f);
+                fclose(f);
+                ESP_LOGI(TAG, "Chunk %ld written to %s", chunk->chunk_index, chunk->filename);
+                
+                // Send acknowledgment
+                char ack[50];
+                snprintf(ack, sizeof(ack), "Chunk %ld received", chunk->chunk_index);
+                send_message(mac, MSG_DATA, ack, strlen(ack) + 1);
+            } else {
+                ESP_LOGE(TAG, "Failed to open file: %s", chunk->filename);
+            }
+            break;
         default:
             ESP_LOGE(TAG, "Unknown message type: %d", msg->msg_type);
             break;
@@ -715,6 +743,83 @@ void execute_command(char* command, bool uart_feedback) {
                             strlen("End command only supported in command files\n"));
         }
     }
+    else if (strstr(command, "upload ")) {
+        // Upload command: upload <filename> <content>
+        char* filename = strtok(command + 7, " ");
+        char* content = strtok(NULL, "\0");  // Get the rest of the command
+        
+        if (filename && content) {
+            FILE* f = fopen(filename, "w");
+            if (f) {
+                fputs(content, f);
+                fclose(f);
+                if (uart_feedback) {
+                    char response[50];
+                    snprintf(response, sizeof(response), "File %s uploaded successfully\n", filename);
+                    uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                }
+            } else {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Error: Could not open file for writing\n", 
+                                strlen("Error: Could not open file for writing\n"));
+            }
+        } else {
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                            "Usage: upload <filename> <content>\n", 
+                            strlen("Usage: upload <filename> <content>\n"));
+        }
+    }
+    else if (strstr(command, "cat ")) {
+        // Read file contents: cat <filename>
+        char* filename = command + 4;
+        FILE* f = fopen(filename, "r");
+        if (f) {
+            char buffer[128];
+            while (fgets(buffer, sizeof(buffer), f)) {
+                uart_write_bytes(UART_PORT_NUM, buffer, strlen(buffer));
+            }
+            fclose(f);
+            uart_write_bytes(UART_PORT_NUM, "\n", 1);
+        } else {
+            char response[50];
+            snprintf(response, sizeof(response), "Error: File %s not found\n", filename);
+            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+        }
+    }
+    else if (strstr(command, "rm ")) {
+        // Remove file: rm <filename>
+        char* filename = command + 3;
+        if (remove(filename) == 0) {
+            char response[50];
+            snprintf(response, sizeof(response), "File %s removed\n", filename);
+            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+        } else {
+            char response[50];
+            snprintf(response, sizeof(response), "Error: Could not remove %s\n", filename);
+            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+        }
+    }
+    else if (strcmp(command, "ls") == 0) {
+        // List files in SPIFFS
+        DIR* dir = opendir("/spiffs");
+        if (dir) {
+            struct dirent* entry;
+            char response[256]; // Use a larger fixed buffer
+            while ((entry = readdir(dir)) != NULL) {
+                // Safely format the filename with truncation prevention
+                int written = snprintf(response, sizeof(response), "%s\n", entry->d_name);
+                if (written < 0 || written >= sizeof(response)) {
+                    // Handle truncation if needed
+                    response[sizeof(response) - 2] = '\n';
+                    response[sizeof(response) - 1] = '\0';
+                }
+                uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+            }
+            closedir(dir);
+        } else {
+            uart_write_bytes(UART_PORT_NUM, "Error: Could not list directory\n", 
+                            strlen("Error: Could not list directory\n"));
+        }
+    }
     else if (strstr(command, "help")) {
         // Show help
         const char *help_text = 
@@ -732,6 +837,10 @@ void execute_command(char* command, bool uart_feedback) {
             "  hold <time_ms> - Pause execution for specified milliseconds\n"
             "  loop <count> - Start a loop block (must be followed by 'end')\n"
             "  end - End a loop block\n"
+            "  upload <filename> <content> - Upload content to a file\n"
+            "  cat <filename> - Display file contents\n"
+            "  rm <filename> - Remove a file\n"
+            "  ls - List files in SPIFFS\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
     }
