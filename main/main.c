@@ -685,6 +685,36 @@ void execute_command(char* command, bool uart_feedback) {
         char *file_path = command + 8;  // Skip "execute "
         process_command_file(file_path);  // Function to process the file
     }
+    else if (strstr(command, "hold ")) {
+        // Hold command: hold <time_ms>
+        int hold_time = atoi(command + 5); // Skip "hold "
+        if (hold_time > 0) {
+            if (uart_feedback) {
+                char response[30];
+                snprintf(response, sizeof(response), "Holding for %d ms\n", hold_time);
+                uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+            }
+            vTaskDelay(hold_time / portTICK_PERIOD_MS);
+        } else {
+            if (uart_feedback) {
+                uart_write_bytes(UART_PORT_NUM, "Invalid hold time\n", strlen("Invalid hold time\n"));
+            }
+        }
+    }
+    else if (strstr(command, "loop ")) {
+        if (uart_feedback) {
+            uart_write_bytes(UART_PORT_NUM, 
+                            "Loop command only supported in command files\n", 
+                            strlen("Loop command only supported in command files\n"));
+        }
+    }
+    else if (strcmp(command, "end") == 0) {
+        if (uart_feedback) {
+            uart_write_bytes(UART_PORT_NUM, 
+                            "End command only supported in command files\n", 
+                            strlen("End command only supported in command files\n"));
+        }
+    }
     else if (strstr(command, "help")) {
         // Show help
         const char *help_text = 
@@ -699,6 +729,9 @@ void execute_command(char* command, bool uart_feedback) {
             "  testpwm - test the pwm-leds"
             "  addmac <MAC>- Add a MAC to known list\n"
             "  execute <file_path> - Execute a COMMANDs file </spiffs/commands.txt>\n"
+            "  hold <time_ms> - Pause execution for specified milliseconds\n"
+            "  loop <count> - Start a loop block (must be followed by 'end')\n"
+            "  end - End a loop block\n"
             "  help - Show this help\n";
         uart_write_bytes(UART_PORT_NUM, help_text, strlen(help_text));
     }
@@ -720,7 +753,13 @@ void process_command_file(const char *file_path) {
         return;
     }
 
+    // Stack for loop management (support up to 5 nested loops)
+    int loop_counts[5] = {0};
+    long loop_positions[5] = {0};
+    int loop_depth = -1;
+
     char line[100];
+    long current_pos;
     while (fgets(line, sizeof(line), file) != NULL) {
         // Remove newline characters
         char *newline = strchr(line, '\n');
@@ -733,6 +772,65 @@ void process_command_file(const char *file_path) {
             continue;
         }
 
+        // Check for loop command
+        if (strstr(line, "loop ")) {
+            if (loop_depth >= 4) {
+                ESP_LOGE(TAG, "Maximum loop nesting exceeded");
+                uart_write_bytes(UART_PORT_NUM, "Error: Too many nested loops\n", 
+                                strlen("Error: Too many nested loops\n"));
+                break;
+            }
+            
+            loop_depth++;
+            loop_counts[loop_depth] = atoi(line + 5); // Get loop count
+            current_pos = ftell(file); // Remember current position
+            loop_positions[loop_depth] = current_pos; // Next line is start of loop
+            
+            if (loop_counts[loop_depth] <= 0) {
+                ESP_LOGE(TAG, "Invalid loop count: %s", line + 5);
+                uart_write_bytes(UART_PORT_NUM, "Error: Invalid loop count\n", 
+                                strlen("Error: Invalid loop count\n"));
+                break;
+            }
+            
+            ESP_LOGI(TAG, "Starting loop %d, count: %d", loop_depth, loop_counts[loop_depth]);
+            continue;
+        }
+        
+        // Check for end command
+        if (strcmp(line, "end") == 0) {
+            if (loop_depth < 0) {
+                ESP_LOGE(TAG, "End without loop");
+                uart_write_bytes(UART_PORT_NUM, "Error: End without loop\n", 
+                                strlen("Error: End without loop\n"));
+                break;
+            }
+            
+            loop_counts[loop_depth]--;
+            
+            if (loop_counts[loop_depth] > 0) {
+                // Repeat the loop by seeking back to the start position
+                fseek(file, loop_positions[loop_depth], SEEK_SET);
+                ESP_LOGI(TAG, "Loop %d iteration %d", loop_depth, loop_counts[loop_depth]);
+            } else {
+                // Exit the loop
+                ESP_LOGI(TAG, "Exiting loop %d", loop_depth);
+                loop_depth--;
+            }
+            continue;
+        }
+        
+        // Check for hold command
+        if (strstr(line, "hold ")) {
+            int hold_time = atoi(line + 5); // Skip "hold "
+            if (hold_time > 0) {
+                ESP_LOGI(TAG, "Holding for %d ms", hold_time);
+                vTaskDelay(hold_time / portTICK_PERIOD_MS);
+            }
+            continue;
+        }
+        
+        // Execute regular command
         ESP_LOGI(TAG, "Executing command: %s", line);
         execute_command(line, false);  // Execute without UART feedback
     }
@@ -870,7 +968,7 @@ void app_main(void){
     init_led_strip();
     init_pwm_leds();
     init_uart();
-    test_leds();
+    //test_leds();
     init_esp_now();
     init_known_peers();
     set_led_color(0, 32, 0, 1000, 0); // Solid green for ready state
