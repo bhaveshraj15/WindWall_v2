@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.portWin": "COM7",
+  "idf.portWin": "COM10",
   "idf.toolsPathWin": "C:\\Users\\Bhavesh\\.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
