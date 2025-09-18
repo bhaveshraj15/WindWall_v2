@@ -507,66 +507,114 @@ void execute_command(char* command, bool uart_feedback) {
         }
     }
     else if (strstr(command, "led ")) {
-        // LED control command: led <r> <g> <b> <timeout_ms> <blank_ms> [<mac>]
-        // If MAC is provided, send to that device; otherwise, set locally and broadcast to all peers
+        // LED control command: led <r> <g> <b> <timeout_ms> <blank_ms> [mac1] [mac2] [mac3] ...
         int r, g, b, timeout_ms, blank_ms;
-        char mac_str[20] = {0};
         
-        // Parse parameters
-        int parsed = sscanf(command + 4, "%d %d %d %d %d %17s", 
-                           &r, &g, &b, &timeout_ms, &blank_ms, mac_str);
+        // Parse the first 5 parameters
+        char *token = strtok(command + 4, " \t\n");
+        int param_count = 0;
         
-        if (parsed >= 5) {
-            // Format the LED control data
-            char led_data[50];
-            snprintf(led_data, sizeof(led_data), "%d,%d,%d,%d,%d", r, g, b, timeout_ms, blank_ms);
-            
-            if (parsed == 6) {
-                // Send to specific MAC
-                uint8_t mac[6];
-                if (sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
-                          &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
-                    send_message(mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
-                    if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "LED command sent to specific device\n", 
-                                    strlen("LED command sent to specific device\n"));
-                } else {
-                    if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
+        // Parse the required parameters
+        while (token != NULL && param_count < 5) {
+            switch(param_count) {
+                case 0: r = atoi(token); break;
+                case 1: g = atoi(token); break;
+                case 2: b = atoi(token); break;
+                case 3: timeout_ms = atoi(token); break;
+                case 4: blank_ms = atoi(token); break;
+            }
+            param_count++;
+            token = strtok(NULL, " \t\n");
+        }
+        
+        // Validate we have all required parameters
+        if (param_count < 5) {
+            if (uart_feedback) {
+                uart_write_bytes(UART_PORT_NUM, 
+                    "Invalid LED command format\n"
+                    "Usage: led <r> <g> <b> <timeout_ms> <blank_ms> [mac1] [mac2] [mac3] ...\n"
+                    "Example: led 255 0 0 1000 500\n"
+                    "Example: led 0 255 0 500 200 AA:BB:CC:DD:EE:FF\n"
+                    "Example: led 0 0 255 300 100 AA:BB:CC:DD:EE:FF 11:22:33:44:55:66\n",
+                    strlen("Invalid LED command format\n"
+                        "Usage: led <r> <g> <b> <timeout_ms> <blank_ms> [mac1] [mac2] [mac3] ...\n"
+                        "Example: led 255 0 0 1000 500\n"
+                        "Example: led 0 255 0 500 200 AA:BB:CC:DD:EE:FF\n"
+                        "Example: led 0 0 255 300 100 AA:BB:CC:DD:EE:FF 11:22:33:44:55:66\n"));
+            }
+            return;
+        }
+        
+        // Format the LED control data
+        char led_data[50];
+        snprintf(led_data, sizeof(led_data), "%d,%d,%d,%d,%d", r, g, b, timeout_ms, blank_ms);
+        
+        // Check if any MAC addresses were provided
+        bool has_mac_addresses = (token != NULL);
+        bool executed_locally = false;
+        
+        // Process MAC addresses if provided
+        while (token != NULL) {
+            uint8_t mac[6];
+            if (parse_mac_address(token, mac)) {
+                send_message(mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
+                if (uart_feedback) {
+                    char response[100];
+                    snprintf(response, sizeof(response), 
+                            "LED command sent to: %s\n", token);
+                    uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                 }
             } else {
-                // Set locally and broadcast to all peers
-                set_led_color(r, g, b, timeout_ms, blank_ms);
-                
-                // Send to all paired peers
-                for (int i = 0; i < peer_count; i++) {
-                    if (peers[i].paired) {
-                        send_message(peers[i].mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
-                    }
+                if (uart_feedback) {
+                    char response[100];
+                    snprintf(response, sizeof(response), 
+                            "Invalid MAC format: %s\n", token);
+                    uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                 }
-                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "LED command set locally and sent to all peers\n", 
-                                strlen("LED command set locally and sent to all peers\n"));
             }
-        } else {
-            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
-                            "Usage: led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>]\n"
-                            "Example: led 255 0 0 1000 500\n"
-                            "Example: led 0 255 0 500 200 AA:BB:CC:DD:EE:FF\n", 
-                            strlen("Usage: led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>]\n"
-                                   "Example: led 255 0 0 1000 500\n"
-                                   "Example: led 0 255 0 500 200 AA:BB:CC:DD:EE:FF\n"));
+            token = strtok(NULL, " \t\n");
+        }
+        
+        // If no MAC addresses were provided, execute locally and broadcast to all peers
+        if (!has_mac_addresses) {
+            // Set LED locally
+            set_led_color(r, g, b, timeout_ms, blank_ms);
+            
+            // Send to all paired peers
+            for (int i = 0; i < peer_count; i++) {
+                if (peers[i].paired) {
+                    send_message(peers[i].mac, MSG_LED_CONTROL, led_data, strlen(led_data) + 1);
+                }
+            }
+            
+            if (uart_feedback) {
+                char response[100];
+                snprintf(response, sizeof(response), 
+                        "LED command set locally and sent to all peers: R=%d, G=%d, B=%d, Timeout=%dms, Blank=%dms\n",
+                        r, g, b, timeout_ms, blank_ms);
+                uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+            }
+            executed_locally = true;
+        }
+        
+        // Update the help text to reflect the new format
+        if (uart_feedback && !executed_locally && !has_mac_addresses) {
+            uart_write_bytes(UART_PORT_NUM, 
+                "LED command executed remotely\n", 
+                strlen("LED command executed remotely\n"));
         }
     }
     else if (strstr(command, "motor ")) {
-        // Motor control: motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac]
+        // Motor control: motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac1] [mac2] [mac3] ...
         int motor_values[NUM_MOTORS];
         int delay_time;
-        char mac_str[20] = {0};
         
         // Parse parameters
         char *token = strtok(command + 6, " \t\n");
         int param_count = 0;
         
-        // Parse all parameters
-        while (token != NULL && param_count <= NUM_MOTORS + 1) {
+        // Parse motor values and delay time
+        while (token != NULL && param_count <= NUM_MOTORS) {
             if (param_count < NUM_MOTORS) {
                 motor_values[param_count] = atoi(token);
                 // Validate motor values (1000-2000 µs)
@@ -574,9 +622,7 @@ void execute_command(char* command, bool uart_feedback) {
                 if (motor_values[param_count] > 2000) motor_values[param_count] = 2000;
             } else if (param_count == NUM_MOTORS) {
                 delay_time = atoi(token);
-            } else {
-                strncpy(mac_str, token, sizeof(mac_str) - 1);
-            }
+            } 
             param_count++;
             token = strtok(NULL, " \t\n");
         }
@@ -586,10 +632,10 @@ void execute_command(char* command, bool uart_feedback) {
             if (uart_feedback) {
                 uart_write_bytes(UART_PORT_NUM, 
                     "Invalid motor command format\n"
-                    "Usage: motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac]\n"
+                    "Usage: motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac1] [mac2] [mac3] ...\n"
                     "Motor values: 1000-2000 µs\n",
                     strlen("Invalid motor command format\n"
-                        "Usage: motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac]\n"
+                        "Usage: motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac1] [mac2] [mac3] ...\n"
                         "Motor values: 1000-2000 µs\n"));
             }
             return;
@@ -601,22 +647,26 @@ void execute_command(char* command, bool uart_feedback) {
                 motor_values[0], motor_values[1], motor_values[2],
                 motor_values[3], motor_values[4], motor_values[5], delay_time);
         
-        if (strlen(mac_str) > 0) {
+        // Check if any MAC addresses were provided
+        bool has_mac_addresses = (token != NULL);
+        bool executed_locally = false;
+
+        // Process MAC addresses if provided
+        while (token != NULL) {
             // Send to specific MAC address
             uint8_t mac[6];
-            if (parse_mac_address(mac_str, mac)) {
+            if (parse_mac_address(token, mac)) {
                 send_message(mac, MSG_MOTOR_CONTROL, motor_data, strlen(motor_data) + 1);
                 if (uart_feedback) {
                     char response[100];
                     snprintf(response, sizeof(response), 
-                            "Motor command sent to remote device: %s\n", mac_str);
+                            "Motor command sent to remote device: %s\n", token);
                     uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                 }
-            } else {
-                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", 
-                                strlen("Invalid MAC format\n"));
-            }
-        } else {
+            } 
+            token = strtok(NULL, " \t\n");
+        } 
+        if (!has_mac_addresses) {
             // Execute locally
             for (int j = 0; j < NUM_MOTORS; j++) {
                 set_motor_pulse(j, motor_values[j]);
@@ -636,6 +686,13 @@ void execute_command(char* command, bool uart_feedback) {
                         motor_values[3], motor_values[4], motor_values[5], delay_time);
                 uart_write_bytes(UART_PORT_NUM, response, strlen(response));
             }
+            executed_locally = true;
+        }
+        // Update the help text to reflect the new format
+        if (uart_feedback && !executed_locally && !has_mac_addresses) {
+            uart_write_bytes(UART_PORT_NUM, 
+                "Motor command executed remotely\n", 
+                strlen("Motor command executed remotely\n"));
         }
     }
     else if (strstr(command, "me")){
