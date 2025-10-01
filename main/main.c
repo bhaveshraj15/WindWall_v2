@@ -288,7 +288,10 @@ static const char *known_macs[] = {
     "F0:9E:9E:1E:4A:84",
     "F0:9E:9E:1E:4A:E4",
     "F0:9E:9E:21:E2:70",
-    "A0:85:E3:E8:00:EC",
+    "A0:85:E3:E8:00:EC", // Master
+    "B4:3A:45:A3:54:04",
+    "FC:01:2C:C5:4A:48", 
+    "94:A9:90:2E:92:08",
     // Add more MAC addresses as needed
 };
 static int known_mac_count = sizeof(known_macs) / sizeof(known_macs[0]);
