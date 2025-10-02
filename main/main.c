@@ -285,10 +285,11 @@ void send_message(const uint8_t *mac, message_type_t type, const void *data, siz
 
 // Add this to your peer management section
 static const char *known_macs[] = {
+    "A0:85:E3:E8:00:EC", // Master
+    "ff:ff:ff:ff:ff:ff", // for broadcasting
     "F0:9E:9E:1E:4A:84",
     "F0:9E:9E:1E:4A:E4",
     "F0:9E:9E:21:E2:70",
-    "A0:85:E3:E8:00:EC", // Master
     "B4:3A:45:A3:54:04",
     "FC:01:2C:C5:4A:48", 
     "94:A9:90:2E:92:08",
@@ -1006,10 +1007,7 @@ void app_main(void){
     init_known_peers();
     init_motor_pwm();
     set_led_color(0, 32, 0, 1000, 0); // Solid green for ready state
-    // Start dynamic discovery by sending a pairing request
-    uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    send_message(broadcast_mac, MSG_PAIRING_REQUEST, NULL, 0);
-
+    
     // Main loop: send data periodically
     int counter = 0;
 
