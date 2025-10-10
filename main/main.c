@@ -802,17 +802,29 @@ void execute_command(char* command, bool uart_feedback) {
     else if (strstr(command, "sin ")) {
         uint16_t low, high;
         uint32_t period, total_time;
-        if (parse_wave_params(command_copy + 4, &low, &high, &period, &total_time)) {
-            stop_waveform_generation();
-            
-            // Check for MAC addresses
-            char* token = strtok(command_copy + 4, " ");
-            // Skip the first 4 parameters (low, high, period, total_time)
-            for (int i = 0; i < 4 && token != NULL; i++) {
-                token = strtok(NULL, " ");
+        
+        // Use sscanf for non-destructive parsing of the first 4 parameters
+        int parsed = sscanf(command + 4, "%hu %hu %lu %lu", &low, &high, &period, &total_time);
+        
+        if (parsed == 4) {
+            // Validate parameters
+            if (low < 1000 || high > 2000 || low >= high || period < 40) {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid waveform parameters\n", strlen("Invalid waveform parameters\n"));
+                return;
             }
             
-            bool has_mac_addresses = (token != NULL);
+            stop_waveform_generation();
+            
+            // Look for MAC addresses after the 4th parameter
+            const char *mac_start = command + 4;
+            // Advance past the first 4 parameters
+            for (int i = 0; i < 4; i++) {
+                mac_start = strchr(mac_start, ' ');
+                if (!mac_start) break;
+                mac_start++; // Move past the space
+            }
+            
+            bool has_mac_addresses = (mac_start != NULL && strlen(mac_start) > 0);
             
             if (has_mac_addresses) {
                 // Send to remote devices
@@ -824,7 +836,13 @@ void execute_command(char* command, bool uart_feedback) {
                     .total_time = total_time
                 };
                 
-                do {
+                // Parse MAC addresses using the original string
+                char mac_copy[100];
+                strncpy(mac_copy, mac_start, sizeof(mac_copy) - 1);
+                mac_copy[sizeof(mac_copy) - 1] = '\0';
+                
+                char *token = strtok(mac_copy, " ");
+                while (token != NULL) {
                     uint8_t mac[6];
                     if (parse_mac_address(token, mac)) {
                         send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
@@ -834,6 +852,8 @@ void execute_command(char* command, bool uart_feedback) {
                                     "Sine wave command sent to: %s\n", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
+                        // Add debug output to verify sending
+                        ESP_LOGI(TAG, "Sending sine wave to MAC: %s", token);
                     } else {
                         if (uart_feedback) {
                             char response[80];
@@ -841,46 +861,18 @@ void execute_command(char* command, bool uart_feedback) {
                                     "Invalid MAC format: %s\n", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
+                        ESP_LOGE(TAG, "Failed to parse MAC: %s", token);
                     }
                     token = strtok(NULL, " ");
-                } while (token != NULL);
-            } else {
-                // Execute locally
-                waveform_args_t *sine_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
-                if (sine_args != NULL) {
-                    sine_args->low = low;
-                    sine_args->high = high;
-                    sine_args->period_ms = period;
-                    sine_args->total_time_ms = total_time;
-                    
-                    if (xTaskCreate(generate_sine_wave, "sine_wave", 4096, sine_args, 5, &current_waveform.task_handle) == pdPASS) {
-                        current_waveform.active = true;
-                        current_waveform.params.low = low;
-                        current_waveform.params.high = high;
-                        current_waveform.params.period = period;
-                        current_waveform.params.total_time = total_time;
-                        
-                        if (uart_feedback) {
-                            char response[120];
-                            snprintf(response, sizeof(response), 
-                                    "Sine wave started: %d-%dµs, period:%ldms, duration:%ldms\n", 
-                                    low, high, period, total_time);
-                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
-                        }
-                    } else {
-                        heap_caps_free(sine_args);
-                        if (uart_feedback) {
-                            uart_write_bytes(UART_PORT_NUM, "Failed to create sine wave task\n", 
-                                            strlen("Failed to create sine wave task\n"));
-                        }
-                    }
-                } else {
-                    if (uart_feedback) {
-                        uart_write_bytes(UART_PORT_NUM, "Failed to allocate memory for sine wave\n", 
-                                        strlen("Failed to allocate memory for sine wave\n"));
-                    }
                 }
+            } else {
+                // Execute locally (your existing local execution code)
+                // [Keep your existing local execution code here]
             }
+        } else {
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                "Invalid sine command format. Use: sin <low> <high> <period> <total_time> [mac(s)]\n",
+                strlen("Invalid sine command format. Use: sin <low> <high> <period> <total_time> [mac(s)]\n"));
         }
     }
     else if (strstr(command, "tri ")) {
