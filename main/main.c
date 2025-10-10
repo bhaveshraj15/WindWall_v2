@@ -878,18 +878,32 @@ void execute_command(char* command, bool uart_feedback) {
     else if (strstr(command, "tri ")) {
         uint16_t low, high;
         uint32_t period, total_time;
-        if (parse_wave_params(command_copy + 4, &low, &high, &period, &total_time)) {
-            stop_waveform_generation();
-            
-            // Check for MAC addresses
-            char* token = strtok(command_copy + 4, " ");
-            for (int i = 0; i < 4 && token != NULL; i++) {
-                token = strtok(NULL, " ");
+        
+        // Use sscanf for non-destructive parsing of the first 4 parameters
+        int parsed = sscanf(command + 4, "%hu %hu %lu %lu", &low, &high, &period, &total_time);
+        
+        if (parsed == 4) {
+            // Validate parameters
+            if (low < 1000 || high > 2000 || low >= high || period < 40) {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid waveform parameters\n", strlen("Invalid waveform parameters\n"));
+                return;
             }
             
-            bool has_mac_addresses = (token != NULL);
+            stop_waveform_generation();
+            
+            // Look for MAC addresses after the 4th parameter
+            const char *mac_start = command + 4;
+            // Advance past the first 4 parameters
+            for (int i = 0; i < 4; i++) {
+                mac_start = strchr(mac_start, ' ');
+                if (!mac_start) break;
+                mac_start++; // Move past the space
+            }
+            
+            bool has_mac_addresses = (mac_start != NULL && strlen(mac_start) > 0);
             
             if (has_mac_addresses) {
+                // Send to remote devices
                 waveform_control_t wave_cmd = {
                     .type = WAVE_TRIANGULAR,
                     .low = low,
@@ -898,9 +912,30 @@ void execute_command(char* command, bool uart_feedback) {
                     .total_time = total_time
                 };
                 
-                do {
+                // Parse MAC addresses using a copy of the string
+                char mac_copy[100];
+                strncpy(mac_copy, mac_start, sizeof(mac_copy) - 1);
+                mac_copy[sizeof(mac_copy) - 1] = '\0';
+                
+                char *token = strtok(mac_copy, " ");
+                while (token != NULL) {
                     uint8_t mac[6];
                     if (parse_mac_address(token, mac)) {
+                        // Check if peer exists before sending
+                        bool peer_exists = false;
+                        for (int i = 0; i < peer_count; i++) {
+                            if (memcmp(peers[i].mac, mac, 6) == 0) {
+                                peer_exists = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!peer_exists) {
+                            ESP_LOGW(TAG, "MAC %s not in peer list, attempting to add", token);
+                            add_peer(mac, true);
+                            vTaskDelay(100 / portTICK_PERIOD_MS); // Brief delay for peer registration
+                        }
+                        
                         send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
                         if (uart_feedback) {
                             char response[80];
@@ -908,6 +943,7 @@ void execute_command(char* command, bool uart_feedback) {
                                     "Triangular wave command sent to: %s\n", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
+                        ESP_LOGI(TAG, "Sending triangular wave to MAC: %s", token);
                     } else {
                         if (uart_feedback) {
                             char response[80];
@@ -915,9 +951,10 @@ void execute_command(char* command, bool uart_feedback) {
                                     "Invalid MAC format: %s\n", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
+                        ESP_LOGE(TAG, "Failed to parse MAC: %s", token);
                     }
                     token = strtok(NULL, " ");
-                } while (token != NULL);
+                }
             } else {
                 // Execute locally
                 waveform_args_t *tri_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
@@ -955,23 +992,41 @@ void execute_command(char* command, bool uart_feedback) {
                     }
                 }
             }
+        } else {
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                "Invalid triangular command format. Use: tri <low> <high> <period> <total_time> [mac(s)]\n",
+                strlen("Invalid triangular command format. Use: tri <low> <high> <period> <total_time> [mac(s)]\n"));
         }
     }
     else if (strstr(command, "saw ")) {
         uint16_t low, high;
         uint32_t period, total_time;
-        if (parse_wave_params(command_copy + 4, &low, &high, &period, &total_time)) {
-            stop_waveform_generation();
-            
-            // Check for MAC addresses
-            char* token = strtok(command_copy + 4, " ");
-            for (int i = 0; i < 4 && token != NULL; i++) {
-                token = strtok(NULL, " ");
+        
+        // Use sscanf for non-destructive parsing of the first 4 parameters
+        int parsed = sscanf(command + 4, "%hu %hu %lu %lu", &low, &high, &period, &total_time);
+        
+        if (parsed == 4) {
+            // Validate parameters
+            if (low < 1000 || high > 2000 || low >= high || period < 40) {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid waveform parameters\n", strlen("Invalid waveform parameters\n"));
+                return;
             }
             
-            bool has_mac_addresses = (token != NULL);
+            stop_waveform_generation();
+            
+            // Look for MAC addresses after the 4th parameter
+            const char *mac_start = command + 4;
+            // Advance past the first 4 parameters
+            for (int i = 0; i < 4; i++) {
+                mac_start = strchr(mac_start, ' ');
+                if (!mac_start) break;
+                mac_start++; // Move past the space
+            }
+            
+            bool has_mac_addresses = (mac_start != NULL && strlen(mac_start) > 0);
             
             if (has_mac_addresses) {
+                // Send to remote devices
                 waveform_control_t wave_cmd = {
                     .type = WAVE_SAWTOOTH,
                     .low = low,
@@ -980,9 +1035,30 @@ void execute_command(char* command, bool uart_feedback) {
                     .total_time = total_time
                 };
                 
-                do {
+                // Parse MAC addresses using a copy of the string
+                char mac_copy[100];
+                strncpy(mac_copy, mac_start, sizeof(mac_copy) - 1);
+                mac_copy[sizeof(mac_copy) - 1] = '\0';
+                
+                char *token = strtok(mac_copy, " ");
+                while (token != NULL) {
                     uint8_t mac[6];
                     if (parse_mac_address(token, mac)) {
+                        // Check if peer exists before sending
+                        bool peer_exists = false;
+                        for (int i = 0; i < peer_count; i++) {
+                            if (memcmp(peers[i].mac, mac, 6) == 0) {
+                                peer_exists = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!peer_exists) {
+                            ESP_LOGW(TAG, "MAC %s not in peer list, attempting to add", token);
+                            add_peer(mac, true);
+                            vTaskDelay(100 / portTICK_PERIOD_MS); // Brief delay for peer registration
+                        }
+                        
                         send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
                         if (uart_feedback) {
                             char response[80];
@@ -990,6 +1066,7 @@ void execute_command(char* command, bool uart_feedback) {
                                     "Sawtooth wave command sent to: %s\n", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
+                        ESP_LOGI(TAG, "Sending sawtooth wave to MAC: %s", token);
                     } else {
                         if (uart_feedback) {
                             char response[80];
@@ -997,9 +1074,10 @@ void execute_command(char* command, bool uart_feedback) {
                                     "Invalid MAC format: %s\n", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
+                        ESP_LOGE(TAG, "Failed to parse MAC: %s", token);
                     }
                     token = strtok(NULL, " ");
-                } while (token != NULL);
+                }
             } else {
                 // Execute locally
                 waveform_args_t *saw_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
@@ -1037,6 +1115,10 @@ void execute_command(char* command, bool uart_feedback) {
                     }
                 }
             }
+        } else {
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                "Invalid sawtooth command format. Use: saw <low> <high> <period> <total_time> [mac(s)]\n",
+                strlen("Invalid sawtooth command format. Use: saw <low> <high> <period> <total_time> [mac(s)]\n"));
         }
     }
     else if (strcmp(command, "wave stop") == 0) {
