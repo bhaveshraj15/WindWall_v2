@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "esp_system.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
@@ -17,6 +18,7 @@
 #include "driver/ledc.h"
 #include "esp_timer.h"
 #include "esp_spiffs.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "WW_Comm"; //logging tag
 
@@ -63,7 +65,8 @@ typedef enum {
     MSG_PAIRING_RESPONSE,
     MSG_DATA,
     MSG_LED_CONTROL,
-    MSG_MOTOR_CONTROL
+    MSG_MOTOR_CONTROL,
+    MSG_WAVEFORM_CONTROL
 } message_type_t;
 
 // Message structure
@@ -86,11 +89,48 @@ typedef struct {
 static peer_device_t peers[10];
 static int peer_count = 0;
 
+// Waveform types
+typedef enum {
+    WAVE_SINE,
+    WAVE_TRIANGULAR,
+    WAVE_SAWTOOTH
+} waveform_type_t;
+
+// Waveform control structure for ESP-NOW messages
+typedef struct __attribute__((packed)) {
+    waveform_type_t type;
+    uint16_t low;
+    uint16_t high;
+    uint32_t period;
+    uint32_t total_time;
+} waveform_control_t;
+
+// Structure for passing parameters to waveform tasks
+typedef struct {
+    uint16_t low;
+    uint16_t high;
+    uint32_t period_ms;
+    uint32_t total_time_ms;
+} waveform_args_t;
+
+typedef struct {
+    waveform_control_t params;
+    bool active;
+    TaskHandle_t task_handle;
+} waveform_state_t;
+
+static waveform_state_t current_waveform = {0};
+
 // Function declarations
 void execute_command(char *command, bool uart_feedback);
 void process_command_file(const char *file_path);
 void process_uart_command(char* command);
 bool parse_mac_address(const char *mac_str, uint8_t *mac);
+void generate_sine_wave(void *pvParameters);
+void generate_triangular_wave(void *pvParameters);
+void generate_sawtooth_wave(void *pvParameters);
+void stop_waveform_generation(void);
+static bool parse_wave_params(char* buf, uint16_t *low, uint16_t *high, uint32_t *period, uint32_t *total_time);
 void init_known_peers(void);
 void set_led_color(int r, int g, int b, int timeout_ms, int blank_ms);
 void set_brightness(int index, int percent);
@@ -430,6 +470,53 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
                 ESP_LOGE(TAG, "Invalid motor control format: %s", (char *)msg->data);
             }
             break;
+        case MSG_WAVEFORM_CONTROL:
+            ESP_LOGI(TAG, "Waveform control message received");
+            waveform_control_t *wave_cmd = (waveform_control_t *)msg->data;
+            
+            // Allocate memory for waveform parameters
+            waveform_args_t *wave_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
+            if (wave_args == NULL) {
+                ESP_LOGE(TAG, "Failed to allocate memory for waveform parameters");
+                break;
+            }
+            
+            wave_args->low = wave_cmd->low;
+            wave_args->high = wave_cmd->high;
+            wave_args->period_ms = wave_cmd->period;
+            wave_args->total_time_ms = wave_cmd->total_time;
+            
+            BaseType_t task_result;
+            
+            switch (wave_cmd->type) {
+                case WAVE_SINE:
+                    stop_waveform_generation();
+                    task_result = xTaskCreate(generate_sine_wave, "remote_sine", 4096, wave_args, 5, &current_waveform.task_handle);
+                    break;
+                case WAVE_TRIANGULAR:
+                    stop_waveform_generation();
+                    task_result = xTaskCreate(generate_triangular_wave, "remote_tri", 4096, wave_args, 5, &current_waveform.task_handle);
+                    break;
+                case WAVE_SAWTOOTH:
+                    stop_waveform_generation();
+                    task_result = xTaskCreate(generate_sawtooth_wave, "remote_saw", 4096, wave_args, 5, &current_waveform.task_handle);
+                    break;
+                default:
+                    heap_caps_free(wave_args);
+                    task_result = pdFALSE;
+                    break;
+            }
+            
+            if (task_result == pdPASS) {
+                current_waveform.active = true;
+                current_waveform.params = *wave_cmd;
+            } else {
+                heap_caps_free(wave_args);
+                ESP_LOGE(TAG, "Failed to create waveform task");
+            }
+            
+            set_led_color(0, 32, 32, 300, 100);
+            break;
         default:
             ESP_LOGE(TAG, "Unknown message type: %d", msg->msg_type);
             break;
@@ -437,6 +524,203 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
     if (!peer_found && msg->msg_type != MSG_PAIRING_REQUEST) {
         ESP_LOGW(TAG, "Message from unknown peer, adding to list");
         add_peer(mac, true);
+    }
+}
+
+static bool parse_wave_params(char* buf, uint16_t *low, uint16_t *high, uint32_t *period, uint32_t *total_time) {
+    char* low_str = strtok(buf, " ");
+    char* high_str = strtok(NULL, " ");
+    char* period_str = strtok(NULL, " ");
+    char* time_str = strtok(NULL, " ");
+
+    if (!low_str || !high_str || !period_str || !time_str) {
+        ESP_LOGW(TAG, "Missing parameters. Format: CMD low high period total_time [mac(s)]");
+        return false;
+    }
+
+    *low = atoi(low_str);
+    *high = atoi(high_str);
+    *period = atoi(period_str);
+    *total_time = atoi(time_str);
+
+    // Validate ESC-safe parameters
+    if (*low < 1000 || *high > 2000 || *low >= *high || *period < 40 || *total_time < 0) {
+        ESP_LOGW(TAG, "Invalid params (low:%d high:%d period:%d time:%d)", *low, *high, *period, *total_time);
+        ESP_LOGW(TAG, "Requires: 1000≤low<high≤2000, period≥40ms, time≥0ms");
+        return false;
+    }
+
+    return true;
+}
+
+void generate_sine_wave(void *pvParameters) {
+    // Extract parameters from the structure
+    waveform_args_t *args = (waveform_args_t *)pvParameters;
+    uint16_t low = args->low;
+    uint16_t high = args->high;
+    uint32_t period_ms = args->period_ms;
+    uint32_t total_time_ms = args->total_time_ms;
+    
+    const uint16_t center = (low + high) / 2;
+    const uint16_t amplitude = (high - low) / 2;
+    const uint32_t step_duration = 20; // 50Hz update rate
+    
+    ESP_LOGI(TAG, "SINE: %d-%dµs, period:%dms, duration:%dms", low, high, period_ms, total_time_ms);
+
+    uint32_t start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t end_time = (total_time_ms > 0) ? (start_time + total_time_ms) : UINT32_MAX;
+    
+    while (current_waveform.active) {
+        // Check if we've reached the time limit (if total_time_ms > 0)
+        if (total_time_ms > 0) {
+            uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (current_time >= end_time) {
+                break;
+            }
+        }
+        
+        uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - start_time;
+        double phase = 2 * M_PI * fmod((double)elapsed, period_ms) / period_ms;
+        uint16_t pulse = center + amplitude * sin(phase);
+        pulse = (pulse < low) ? low : (pulse > high) ? high : pulse;
+        
+        // Apply to all motors
+        for (int i = 0; i < NUM_MOTORS; i++) {
+            set_motor_pulse(i, pulse);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(step_duration));
+    }
+    
+    // Return to idle when stopped or time elapsed
+    for (int i = 0; i < NUM_MOTORS; i++) {
+        set_motor_pulse(i, 1000);
+    }
+    
+    // Free the allocated memory
+    heap_caps_free(args);
+    current_waveform.active = false;
+    current_waveform.task_handle = NULL;
+    ESP_LOGI(TAG, "Sine wave completed");
+    vTaskDelete(NULL);
+}
+
+void generate_triangular_wave(void *pvParameters) {
+    // Extract parameters from the structure
+    waveform_args_t *args = (waveform_args_t *)pvParameters;
+    uint16_t low = args->low;
+    uint16_t high = args->high;
+    uint32_t period_ms = args->period_ms;
+    uint32_t total_time_ms = args->total_time_ms;
+    
+    const uint32_t half_period = period_ms / 2;
+    const uint32_t step_duration = 20;
+    
+    ESP_LOGI(TAG, "TRI: %d-%dµs, period:%dms, duration:%dms", low, high, period_ms, total_time_ms);
+
+    uint32_t start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t end_time = (total_time_ms > 0) ? (start_time + total_time_ms) : UINT32_MAX;
+    
+    while (current_waveform.active) {
+        // Check if we've reached the time limit (if total_time_ms > 0)
+        if (total_time_ms > 0) {
+            uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (current_time >= end_time) {
+                break;
+            }
+        }
+        uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - start_time;
+        uint32_t mod_time = elapsed % period_ms;
+        uint16_t pulse;
+        
+        if (mod_time < half_period) {
+            pulse = low + (high - low) * mod_time / half_period;
+        } else {
+            uint32_t fall_time = mod_time - half_period;
+            pulse = high - (high - low) * fall_time / half_period;
+        }
+        
+        for (int i = 0; i < NUM_MOTORS; i++) {
+            set_motor_pulse(i, pulse);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(step_duration));
+    }
+    
+    for (int i = 0; i < NUM_MOTORS; i++) {
+        set_motor_pulse(i, 1000);
+    }
+    
+    // Free the allocated memory
+    heap_caps_free(args);
+    current_waveform.active = false;
+    current_waveform.task_handle = NULL;
+    ESP_LOGI(TAG, "Triangular wave completed");
+    vTaskDelete(NULL);
+}
+
+void generate_sawtooth_wave(void *pvParameters) {
+    // Extract parameters from the structure
+    waveform_args_t *args = (waveform_args_t *)pvParameters;
+    uint16_t low = args->low;
+    uint16_t high = args->high;
+    uint32_t period_ms = args->period_ms;
+    uint32_t total_time_ms = args->total_time_ms;
+    
+    const uint32_t step_duration = 20;
+    
+    ESP_LOGI(TAG, "SAW: %d-%dµs, period:%dms, duration:%dms", low, high, period_ms, total_time_ms);
+
+    uint32_t start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t end_time = (total_time_ms > 0) ? (start_time + total_time_ms) : UINT32_MAX;
+    
+    while (current_waveform.active) {
+        // Check if we've reached the time limit (if total_time_ms > 0)
+        if (total_time_ms > 0) {
+            uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (current_time >= end_time) {
+                break;
+            }
+        }
+        uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - start_time;
+        uint32_t mod_time = elapsed % period_ms;
+        uint16_t pulse = low + (high - low) * mod_time / period_ms;
+        
+        for (int i = 0; i < NUM_MOTORS; i++) {
+            set_motor_pulse(i, pulse);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(step_duration));
+    }
+    
+    for (int i = 0; i < NUM_MOTORS; i++) {
+        set_motor_pulse(i, 1000);
+    }
+    
+    // Free the allocated memory
+    heap_caps_free(args);
+    current_waveform.active = false;
+    current_waveform.task_handle = NULL;
+    ESP_LOGI(TAG, "Sawtooth wave completed");
+    vTaskDelete(NULL);
+}
+
+void stop_waveform_generation(void) {
+    if (current_waveform.active) {
+        current_waveform.active = false;
+        if (current_waveform.task_handle != NULL) {
+            // Wait for task to clean up
+            vTaskDelay(pdMS_TO_TICKS(100));
+            // If task is still running, force delete it
+            if (current_waveform.task_handle != NULL) {
+                vTaskDelete(current_waveform.task_handle);
+                current_waveform.task_handle = NULL;
+            }
+        }
+        for (int i = 0; i < NUM_MOTORS; i++) {
+            set_motor_pulse(i, 1000);
+        }
+        ESP_LOGI(TAG, "Waveform generation stopped");
     }
 }
 
@@ -457,6 +741,11 @@ void execute_command(char* command, bool uart_feedback) {
     if (newline) *newline = '\0';
     newline = strchr(command, '\r');
     if (newline) *newline = '\0';
+
+    // Create a copy for parsing to avoid destroying original string
+    char command_copy[100];
+    strncpy(command_copy, command, sizeof(command_copy) - 1);
+    command_copy[sizeof(command_copy) - 1] = '\0';
         
     if (strstr(command, "discover")) {
         // Manual discovery trigger
@@ -509,6 +798,258 @@ void execute_command(char* command, bool uart_feedback) {
         } else {
             if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid MAC format\n", strlen("Invalid MAC format\n"));
         }
+    }
+    else if (strstr(command, "sin ")) {
+        uint16_t low, high;
+        uint32_t period, total_time;
+        if (parse_wave_params(command_copy + 4, &low, &high, &period, &total_time)) {
+            stop_waveform_generation();
+            
+            // Check for MAC addresses
+            char* token = strtok(command_copy + 4, " ");
+            // Skip the first 4 parameters (low, high, period, total_time)
+            for (int i = 0; i < 4 && token != NULL; i++) {
+                token = strtok(NULL, " ");
+            }
+            
+            bool has_mac_addresses = (token != NULL);
+            
+            if (has_mac_addresses) {
+                // Send to remote devices
+                waveform_control_t wave_cmd = {
+                    .type = WAVE_SINE,
+                    .low = low,
+                    .high = high,
+                    .period = period,
+                    .total_time = total_time
+                };
+                
+                do {
+                    uint8_t mac[6];
+                    if (parse_mac_address(token, mac)) {
+                        send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
+                        if (uart_feedback) {
+                            char response[80];
+                            snprintf(response, sizeof(response), 
+                                    "Sine wave command sent to: %s\n", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    } else {
+                        if (uart_feedback) {
+                            char response[80];
+                            snprintf(response, sizeof(response), 
+                                    "Invalid MAC format: %s\n", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    }
+                    token = strtok(NULL, " ");
+                } while (token != NULL);
+            } else {
+                // Execute locally
+                waveform_args_t *sine_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
+                if (sine_args != NULL) {
+                    sine_args->low = low;
+                    sine_args->high = high;
+                    sine_args->period_ms = period;
+                    sine_args->total_time_ms = total_time;
+                    
+                    if (xTaskCreate(generate_sine_wave, "sine_wave", 4096, sine_args, 5, &current_waveform.task_handle) == pdPASS) {
+                        current_waveform.active = true;
+                        current_waveform.params.low = low;
+                        current_waveform.params.high = high;
+                        current_waveform.params.period = period;
+                        current_waveform.params.total_time = total_time;
+                        
+                        if (uart_feedback) {
+                            char response[120];
+                            snprintf(response, sizeof(response), 
+                                    "Sine wave started: %d-%dµs, period:%ldms, duration:%ldms\n", 
+                                    low, high, period, total_time);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    } else {
+                        heap_caps_free(sine_args);
+                        if (uart_feedback) {
+                            uart_write_bytes(UART_PORT_NUM, "Failed to create sine wave task\n", 
+                                            strlen("Failed to create sine wave task\n"));
+                        }
+                    }
+                } else {
+                    if (uart_feedback) {
+                        uart_write_bytes(UART_PORT_NUM, "Failed to allocate memory for sine wave\n", 
+                                        strlen("Failed to allocate memory for sine wave\n"));
+                    }
+                }
+            }
+        }
+    }
+    else if (strstr(command, "tri ")) {
+        uint16_t low, high;
+        uint32_t period, total_time;
+        if (parse_wave_params(command_copy + 4, &low, &high, &period, &total_time)) {
+            stop_waveform_generation();
+            
+            // Check for MAC addresses
+            char* token = strtok(command_copy + 4, " ");
+            for (int i = 0; i < 4 && token != NULL; i++) {
+                token = strtok(NULL, " ");
+            }
+            
+            bool has_mac_addresses = (token != NULL);
+            
+            if (has_mac_addresses) {
+                waveform_control_t wave_cmd = {
+                    .type = WAVE_TRIANGULAR,
+                    .low = low,
+                    .high = high,
+                    .period = period,
+                    .total_time = total_time
+                };
+                
+                do {
+                    uint8_t mac[6];
+                    if (parse_mac_address(token, mac)) {
+                        send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
+                        if (uart_feedback) {
+                            char response[80];
+                            snprintf(response, sizeof(response), 
+                                    "Triangular wave command sent to: %s\n", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    } else {
+                        if (uart_feedback) {
+                            char response[80];
+                            snprintf(response, sizeof(response), 
+                                    "Invalid MAC format: %s\n", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    }
+                    token = strtok(NULL, " ");
+                } while (token != NULL);
+            } else {
+                // Execute locally
+                waveform_args_t *tri_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
+                if (tri_args != NULL) {
+                    tri_args->low = low;
+                    tri_args->high = high;
+                    tri_args->period_ms = period;
+                    tri_args->total_time_ms = total_time;
+                    
+                    if (xTaskCreate(generate_triangular_wave, "tri_wave", 4096, tri_args, 5, &current_waveform.task_handle) == pdPASS) {
+                        current_waveform.active = true;
+                        current_waveform.params.low = low;
+                        current_waveform.params.high = high;
+                        current_waveform.params.period = period;
+                        current_waveform.params.total_time = total_time;
+                        
+                        if (uart_feedback) {
+                            char response[120];
+                            snprintf(response, sizeof(response), 
+                                    "Triangular wave started: %d-%dµs, period:%ldms, duration:%ldms\n", 
+                                    low, high, period, total_time);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    } else {
+                        heap_caps_free(tri_args);
+                        if (uart_feedback) {
+                            uart_write_bytes(UART_PORT_NUM, "Failed to create triangular wave task\n", 
+                                            strlen("Failed to create triangular wave task\n"));
+                        }
+                    }
+                } else {
+                    if (uart_feedback) {
+                        uart_write_bytes(UART_PORT_NUM, "Failed to allocate memory for triangular wave\n", 
+                                        strlen("Failed to allocate memory for triangular wave\n"));
+                    }
+                }
+            }
+        }
+    }
+    else if (strstr(command, "saw ")) {
+        uint16_t low, high;
+        uint32_t period, total_time;
+        if (parse_wave_params(command_copy + 4, &low, &high, &period, &total_time)) {
+            stop_waveform_generation();
+            
+            // Check for MAC addresses
+            char* token = strtok(command_copy + 4, " ");
+            for (int i = 0; i < 4 && token != NULL; i++) {
+                token = strtok(NULL, " ");
+            }
+            
+            bool has_mac_addresses = (token != NULL);
+            
+            if (has_mac_addresses) {
+                waveform_control_t wave_cmd = {
+                    .type = WAVE_SAWTOOTH,
+                    .low = low,
+                    .high = high,
+                    .period = period,
+                    .total_time = total_time
+                };
+                
+                do {
+                    uint8_t mac[6];
+                    if (parse_mac_address(token, mac)) {
+                        send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
+                        if (uart_feedback) {
+                            char response[80];
+                            snprintf(response, sizeof(response), 
+                                    "Sawtooth wave command sent to: %s\n", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    } else {
+                        if (uart_feedback) {
+                            char response[80];
+                            snprintf(response, sizeof(response), 
+                                    "Invalid MAC format: %s\n", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    }
+                    token = strtok(NULL, " ");
+                } while (token != NULL);
+            } else {
+                // Execute locally
+                waveform_args_t *saw_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
+                if (saw_args != NULL) {
+                    saw_args->low = low;
+                    saw_args->high = high;
+                    saw_args->period_ms = period;
+                    saw_args->total_time_ms = total_time;
+                    
+                    if (xTaskCreate(generate_sawtooth_wave, "saw_wave", 4096, saw_args, 5, &current_waveform.task_handle) == pdPASS) {
+                        current_waveform.active = true;
+                        current_waveform.params.low = low;
+                        current_waveform.params.high = high;
+                        current_waveform.params.period = period;
+                        current_waveform.params.total_time = total_time;
+                        
+                        if (uart_feedback) {
+                            char response[120];
+                            snprintf(response, sizeof(response), 
+                                    "Sawtooth wave started: %d-%dµs, period:%ldms, duration:%ldms\n", 
+                                    low, high, period, total_time);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    } else {
+                        heap_caps_free(saw_args);
+                        if (uart_feedback) {
+                            uart_write_bytes(UART_PORT_NUM, "Failed to create sawtooth wave task\n", 
+                                            strlen("Failed to create sawtooth wave task\n"));
+                        }
+                    }
+                } else {
+                    if (uart_feedback) {
+                        uart_write_bytes(UART_PORT_NUM, "Failed to allocate memory for sawtooth wave\n", 
+                                        strlen("Failed to allocate memory for sawtooth wave\n"));
+                    }
+                }
+            }
+        }
+    }
+    else if (strcmp(command, "wave stop") == 0) {
+        stop_waveform_generation();
+        if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Waveform stopped\n", strlen("Waveform stopped\n"));
     }
     else if (strstr(command, "led ")) {
         // LED control command: led <r> <g> <b> <timeout_ms> <blank_ms> [mac1] [mac2] [mac3] ...
@@ -780,6 +1321,16 @@ void execute_command(char* command, bool uart_feedback) {
             "  me - Gives MAC address of Current Device\n"
             "  led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>] - Control LED (local or remote)\n"
             "  motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac] - Control multiple motors (1000-2000 µs)\n"
+            "  sin <low> <high> <period> <total_time> [mac(s)] - Sine wave\n"
+            "  tri <low> <high> <period> <total_time> [mac(s)] - Triangular wave\n"
+            "  saw <low> <high> <period> <total_time> [mac(s)] - Sawtooth wave\n"
+            "  wave stop - Stop waveform generation\n"
+            "  \n"
+            "  Parameters:\n"
+            "    low/high: 1000-2000µs, low < high\n"
+            "    period: ≥40ms\n"
+            "    total_time: duration in ms (0 = infinite)\n"
+            "    mac: optional target devices\n"
             "  addmac <MAC>- Add a MAC to known list\n"
             "  execute <file_path> - Execute a COMMANDs file </spiffs/commands.txt>\n"
             "  hold <time_ms> - Pause execution for specified milliseconds\n"
