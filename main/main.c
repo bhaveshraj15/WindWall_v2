@@ -99,6 +99,7 @@ typedef enum {
 // Waveform control structure for ESP-NOW messages
 typedef struct __attribute__((packed)) {
     waveform_type_t type;
+    uint8_t motor_mask;
     uint16_t low;
     uint16_t high;
     uint32_t period;
@@ -107,6 +108,7 @@ typedef struct __attribute__((packed)) {
 
 // Structure for passing parameters to waveform tasks
 typedef struct {
+    uint8_t motor_mask;
     uint16_t low;
     uint16_t high;
     uint32_t period_ms;
@@ -480,7 +482,7 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
                 ESP_LOGE(TAG, "Failed to allocate memory for waveform parameters");
                 break;
             }
-            
+            wave_args->motor_mask = wave_cmd->motor_mask;
             wave_args->low = wave_cmd->low;
             wave_args->high = wave_cmd->high;
             wave_args->period_ms = wave_cmd->period;
@@ -556,6 +558,7 @@ static bool parse_wave_params(char* buf, uint16_t *low, uint16_t *high, uint32_t
 void generate_sine_wave(void *pvParameters) {
     // Extract parameters from the structure
     waveform_args_t *args = (waveform_args_t *)pvParameters;
+    uint8_t motor_mask = args->motor_mask;
     uint16_t low = args->low;
     uint16_t high = args->high;
     uint32_t period_ms = args->period_ms;
@@ -586,7 +589,7 @@ void generate_sine_wave(void *pvParameters) {
         
         // Apply to all motors
         for (int i = 0; i < NUM_MOTORS; i++) {
-            set_motor_pulse(i, pulse);
+            if (motor_mask & (1 << i)){set_motor_pulse(i, pulse);}
         }
         
         vTaskDelay(pdMS_TO_TICKS(step_duration));
@@ -594,7 +597,7 @@ void generate_sine_wave(void *pvParameters) {
     
     // Return to idle when stopped or time elapsed
     for (int i = 0; i < NUM_MOTORS; i++) {
-        set_motor_pulse(i, 1000);
+        if (motor_mask & (1 << i)){set_motor_pulse(i, 1000);}
     }
     
     // Free the allocated memory
@@ -608,6 +611,7 @@ void generate_sine_wave(void *pvParameters) {
 void generate_triangular_wave(void *pvParameters) {
     // Extract parameters from the structure
     waveform_args_t *args = (waveform_args_t *)pvParameters;
+    uint8_t motor_mask = args->motor_mask;
     uint16_t low = args->low;
     uint16_t high = args->high;
     uint32_t period_ms = args->period_ms;
@@ -641,14 +645,14 @@ void generate_triangular_wave(void *pvParameters) {
         }
         
         for (int i = 0; i < NUM_MOTORS; i++) {
-            set_motor_pulse(i, pulse);
+            if (motor_mask & (1 << i)){set_motor_pulse(i, pulse);}
         }
         
         vTaskDelay(pdMS_TO_TICKS(step_duration));
     }
     
     for (int i = 0; i < NUM_MOTORS; i++) {
-        set_motor_pulse(i, 1000);
+        if (motor_mask & (1 << i)){set_motor_pulse(i, 1000);}
     }
     
     // Free the allocated memory
@@ -662,6 +666,7 @@ void generate_triangular_wave(void *pvParameters) {
 void generate_sawtooth_wave(void *pvParameters) {
     // Extract parameters from the structure
     waveform_args_t *args = (waveform_args_t *)pvParameters;
+    uint8_t motor_mask = args->motor_mask;
     uint16_t low = args->low;
     uint16_t high = args->high;
     uint32_t period_ms = args->period_ms;
@@ -687,14 +692,14 @@ void generate_sawtooth_wave(void *pvParameters) {
         uint16_t pulse = low + (high - low) * mod_time / period_ms;
         
         for (int i = 0; i < NUM_MOTORS; i++) {
-            set_motor_pulse(i, pulse);
+            if (motor_mask & (1 << i)){set_motor_pulse(i, pulse);}
         }
         
         vTaskDelay(pdMS_TO_TICKS(step_duration));
     }
     
     for (int i = 0; i < NUM_MOTORS; i++) {
-        set_motor_pulse(i, 1000);
+        if (motor_mask & (1 << i)){set_motor_pulse(i, 1000);}
     }
     
     // Free the allocated memory
@@ -800,14 +805,34 @@ void execute_command(char* command, bool uart_feedback) {
         }
     }
     else if (strstr(command, "sin ")) {
+        int motor_states[NUM_MOTORS];
         uint16_t low, high;
         uint32_t period, total_time;
         
-        // Use sscanf for non-destructive parsing of the first 4 parameters
-        int parsed = sscanf(command + 4, "%hu %hu %lu %lu", &low, &high, &period, &total_time);
+        // Parse motor states and waveform parameters
+        int parsed = sscanf(command + 4, "%d %d %d %d %d %d %hu %hu %lu %lu", 
+                           &motor_states[0], &motor_states[1], &motor_states[2],
+                           &motor_states[3], &motor_states[4], &motor_states[5],
+                           &low, &high, &period, &total_time);
         
-        if (parsed == 4) {
-            // Validate parameters
+        if (parsed == 10) {
+            // Create motor mask from motor states
+            uint8_t motor_mask = 0;
+            for (int i = 0; i < NUM_MOTORS; i++) {
+                if (motor_states[i] == 1) {
+                    motor_mask |= (1 << i);
+                }
+            }
+            
+            // Validate at least one motor is selected
+            if (motor_mask == 0) {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                    "Error: At least one motor must be enabled (set to 1)\n",
+                    strlen("Error: At least one motor must be enabled (set to 1)\n"));
+                return;
+            }
+            
+            // Validate waveform parameters
             if (low < 1000 || high > 2000 || low >= high || period < 40) {
                 if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid waveform parameters\n", strlen("Invalid waveform parameters\n"));
                 return;
@@ -815,10 +840,10 @@ void execute_command(char* command, bool uart_feedback) {
             
             stop_waveform_generation();
             
-            // Look for MAC addresses after the 4th parameter
+            // Look for MAC addresses after the 10th parameter
             const char *mac_start = command + 4;
-            // Advance past the first 4 parameters
-            for (int i = 0; i < 4; i++) {
+            // Advance past the first 10 parameters
+            for (int i = 0; i < 10; i++) {
                 mac_start = strchr(mac_start, ' ');
                 if (!mac_start) break;
                 mac_start++; // Move past the space
@@ -830,82 +855,7 @@ void execute_command(char* command, bool uart_feedback) {
                 // Send to remote devices
                 waveform_control_t wave_cmd = {
                     .type = WAVE_SINE,
-                    .low = low,
-                    .high = high,
-                    .period = period,
-                    .total_time = total_time
-                };
-                
-                // Parse MAC addresses using the original string
-                char mac_copy[100];
-                strncpy(mac_copy, mac_start, sizeof(mac_copy) - 1);
-                mac_copy[sizeof(mac_copy) - 1] = '\0';
-                
-                char *token = strtok(mac_copy, " ");
-                while (token != NULL) {
-                    uint8_t mac[6];
-                    if (parse_mac_address(token, mac)) {
-                        send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
-                        if (uart_feedback) {
-                            char response[80];
-                            snprintf(response, sizeof(response), 
-                                    "Sine wave command sent to: %s\n", token);
-                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
-                        }
-                        // Add debug output to verify sending
-                        ESP_LOGI(TAG, "Sending sine wave to MAC: %s", token);
-                    } else {
-                        if (uart_feedback) {
-                            char response[80];
-                            snprintf(response, sizeof(response), 
-                                    "Invalid MAC format: %s\n", token);
-                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
-                        }
-                        ESP_LOGE(TAG, "Failed to parse MAC: %s", token);
-                    }
-                    token = strtok(NULL, " ");
-                }
-            } else {
-                // Execute locally (your existing local execution code)
-                // [Keep your existing local execution code here]
-            }
-        } else {
-            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
-                "Invalid sine command format. Use: sin <low> <high> <period> <total_time> [mac(s)]\n",
-                strlen("Invalid sine command format. Use: sin <low> <high> <period> <total_time> [mac(s)]\n"));
-        }
-    }
-    else if (strstr(command, "tri ")) {
-        uint16_t low, high;
-        uint32_t period, total_time;
-        
-        // Use sscanf for non-destructive parsing of the first 4 parameters
-        int parsed = sscanf(command + 4, "%hu %hu %lu %lu", &low, &high, &period, &total_time);
-        
-        if (parsed == 4) {
-            // Validate parameters
-            if (low < 1000 || high > 2000 || low >= high || period < 40) {
-                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid waveform parameters\n", strlen("Invalid waveform parameters\n"));
-                return;
-            }
-            
-            stop_waveform_generation();
-            
-            // Look for MAC addresses after the 4th parameter
-            const char *mac_start = command + 4;
-            // Advance past the first 4 parameters
-            for (int i = 0; i < 4; i++) {
-                mac_start = strchr(mac_start, ' ');
-                if (!mac_start) break;
-                mac_start++; // Move past the space
-            }
-            
-            bool has_mac_addresses = (mac_start != NULL && strlen(mac_start) > 0);
-            
-            if (has_mac_addresses) {
-                // Send to remote devices
-                waveform_control_t wave_cmd = {
-                    .type = WAVE_TRIANGULAR,
+                    .motor_mask = motor_mask,
                     .low = low,
                     .high = high,
                     .period = period,
@@ -938,12 +888,205 @@ void execute_command(char* command, bool uart_feedback) {
                         
                         send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
                         if (uart_feedback) {
+                            char response[100];
+                            snprintf(response, sizeof(response), 
+                                    "Sine wave command sent to: %s (motors: ", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                            
+                            // List enabled motors
+                            bool first = true;
+                            for (int i = 0; i < NUM_MOTORS; i++) {
+                                if (motor_states[i] == 1) {
+                                    char motor_str[10];
+                                    snprintf(motor_str, sizeof(motor_str), "%s%d", first ? "" : ",", i+1);
+                                    uart_write_bytes(UART_PORT_NUM, motor_str, strlen(motor_str));
+                                    first = false;
+                                }
+                            }
+                            uart_write_bytes(UART_PORT_NUM, ")\n", 2);
+                        }
+                        ESP_LOGI(TAG, "Sending sine wave to MAC: %s (motor_mask: 0x%02x)", token, motor_mask);
+                    } else {
+                        if (uart_feedback) {
                             char response[80];
                             snprintf(response, sizeof(response), 
-                                    "Triangular wave command sent to: %s\n", token);
+                                    "Invalid MAC format: %s\n", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
-                        ESP_LOGI(TAG, "Sending triangular wave to MAC: %s", token);
+                        ESP_LOGE(TAG, "Failed to parse MAC: %s", token);
+                    }
+                    token = strtok(NULL, " ");
+                }
+            } else {
+                // Execute locally
+                waveform_args_t *sine_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
+                if (sine_args != NULL) {
+                    sine_args->motor_mask = motor_mask;
+                    sine_args->low = low;
+                    sine_args->high = high;
+                    sine_args->period_ms = period;
+                    sine_args->total_time_ms = total_time;
+                    
+                    if (xTaskCreate(generate_sine_wave, "sine_wave", 4096, sine_args, 5, &current_waveform.task_handle) == pdPASS) {
+                        current_waveform.active = true;
+                        current_waveform.params.motor_mask = motor_mask;
+                        current_waveform.params.low = low;
+                        current_waveform.params.high = high;
+                        current_waveform.params.period = period;
+                        current_waveform.params.total_time = total_time;
+                        
+                        if (uart_feedback) {
+                            char response[150];
+                            snprintf(response, sizeof(response), 
+                                    "Sine wave started on motors: ");
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                            
+                            // List enabled motors
+                            bool first = true;
+                            for (int i = 0; i < NUM_MOTORS; i++) {
+                                if (motor_states[i] == 1) {
+                                    char motor_str[10];
+                                    snprintf(motor_str, sizeof(motor_str), "%s%d", first ? "" : ",", i+1);
+                                    uart_write_bytes(UART_PORT_NUM, motor_str, strlen(motor_str));
+                                    first = false;
+                                }
+                            }
+                            
+                            snprintf(response, sizeof(response), 
+                                    " | Range: %d-%dµs, Period: %ldms, Duration: %ldms\n", 
+                                    low, high, period, total_time);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                        }
+                    } else {
+                        heap_caps_free(sine_args);
+                        if (uart_feedback) {
+                            uart_write_bytes(UART_PORT_NUM, "Failed to create sine wave task\n", 
+                                            strlen("Failed to create sine wave task\n"));
+                        }
+                    }
+                } else {
+                    if (uart_feedback) {
+                        uart_write_bytes(UART_PORT_NUM, "Failed to allocate memory for sine wave\n", 
+                                        strlen("Failed to allocate memory for sine wave\n"));
+                    }
+                }
+            }
+        } else {
+            if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                "Invalid sine command format. Use: sin <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)]\n"
+                "  m1-m6: 0=off, 1=on for each motor\n"
+                "  low/high: 1000-2000µs, low < high\n"
+                "  period: ≥40ms\n"
+                "  total_time: duration in ms (0 = infinite)\n",
+                strlen("Invalid sine command format. Use: sin <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)]\n"
+                      "  m1-m6: 0=off, 1=on for each motor\n"
+                      "  low/high: 1000-2000µs, low < high\n"
+                      "  period: ≥40ms\n"
+                      "  total_time: duration in ms (0 = infinite)\n"));
+        }
+    }
+    else if (strstr(command, "tri ")) {
+        int motor_states[NUM_MOTORS];
+        uint16_t low, high;
+        uint32_t period, total_time;
+        
+        // Parse motor states and waveform parameters
+        int parsed = sscanf(command + 4, "%d %d %d %d %d %d %hu %hu %lu %lu", 
+                           &motor_states[0], &motor_states[1], &motor_states[2],
+                           &motor_states[3], &motor_states[4], &motor_states[5],
+                           &low, &high, &period, &total_time);
+        
+        if (parsed == 10) {
+            // Create motor mask from motor states
+            uint8_t motor_mask = 0;
+            for (int i = 0; i < NUM_MOTORS; i++) {
+                if (motor_states[i] == 1) {
+                    motor_mask |= (1 << i);
+                }
+            }
+            
+            // Validate at least one motor is selected
+            if (motor_mask == 0) {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                    "Error: At least one motor must be enabled (set to 1)\n",
+                    strlen("Error: At least one motor must be enabled (set to 1)\n"));
+                return;
+            }
+            
+            // Validate waveform parameters
+            if (low < 1000 || high > 2000 || low >= high || period < 40) {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid waveform parameters\n", strlen("Invalid waveform parameters\n"));
+                return;
+            }
+            
+            stop_waveform_generation();
+            
+            // Look for MAC addresses after the 10th parameter
+            const char *mac_start = command + 4;
+            // Advance past the first 10 parameters
+            for (int i = 0; i < 10; i++) {
+                mac_start = strchr(mac_start, ' ');
+                if (!mac_start) break;
+                mac_start++; // Move past the space
+            }
+            
+            bool has_mac_addresses = (mac_start != NULL && strlen(mac_start) > 0);
+            
+            if (has_mac_addresses) {
+                // Send to remote devices
+                waveform_control_t wave_cmd = {
+                    .type = WAVE_TRIANGULAR,
+                    .motor_mask = motor_mask,
+                    .low = low,
+                    .high = high,
+                    .period = period,
+                    .total_time = total_time
+                };
+                
+                // Parse MAC addresses using a copy of the string
+                char mac_copy[100];
+                strncpy(mac_copy, mac_start, sizeof(mac_copy) - 1);
+                mac_copy[sizeof(mac_copy) - 1] = '\0';
+                
+                char *token = strtok(mac_copy, " ");
+                while (token != NULL) {
+                    uint8_t mac[6];
+                    if (parse_mac_address(token, mac)) {
+                        // Check if peer exists before sending
+                        bool peer_exists = false;
+                        for (int i = 0; i < peer_count; i++) {
+                            if (memcmp(peers[i].mac, mac, 6) == 0) {
+                                peer_exists = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!peer_exists) {
+                            ESP_LOGW(TAG, "MAC %s not in peer list, attempting to add", token);
+                            add_peer(mac, true);
+                            vTaskDelay(100 / portTICK_PERIOD_MS); // Brief delay for peer registration
+                        }
+                        
+                        send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
+                        if (uart_feedback) {
+                            char response[100];
+                            snprintf(response, sizeof(response), 
+                                    "Triangular wave command sent to: %s (motors: ", token);
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                            
+                            // List enabled motors
+                            bool first = true;
+                            for (int i = 0; i < NUM_MOTORS; i++) {
+                                if (motor_states[i] == 1) {
+                                    char motor_str[10];
+                                    snprintf(motor_str, sizeof(motor_str), "%s%d", first ? "" : ",", i+1);
+                                    uart_write_bytes(UART_PORT_NUM, motor_str, strlen(motor_str));
+                                    first = false;
+                                }
+                            }
+                            uart_write_bytes(UART_PORT_NUM, ")\n", 2);
+                        }
+                        ESP_LOGI(TAG, "Sending triangular wave to MAC: %s (motor_mask: 0x%02x)", token, motor_mask);
                     } else {
                         if (uart_feedback) {
                             char response[80];
@@ -959,6 +1102,7 @@ void execute_command(char* command, bool uart_feedback) {
                 // Execute locally
                 waveform_args_t *tri_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
                 if (tri_args != NULL) {
+                    tri_args->motor_mask = motor_mask;
                     tri_args->low = low;
                     tri_args->high = high;
                     tri_args->period_ms = period;
@@ -966,15 +1110,31 @@ void execute_command(char* command, bool uart_feedback) {
                     
                     if (xTaskCreate(generate_triangular_wave, "tri_wave", 4096, tri_args, 5, &current_waveform.task_handle) == pdPASS) {
                         current_waveform.active = true;
+                        current_waveform.params.motor_mask = motor_mask;
                         current_waveform.params.low = low;
                         current_waveform.params.high = high;
                         current_waveform.params.period = period;
                         current_waveform.params.total_time = total_time;
                         
                         if (uart_feedback) {
-                            char response[120];
+                            char response[150];
                             snprintf(response, sizeof(response), 
-                                    "Triangular wave started: %d-%dµs, period:%ldms, duration:%ldms\n", 
+                                    "Triangular wave started on motors: ");
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                            
+                            // List enabled motors
+                            bool first = true;
+                            for (int i = 0; i < NUM_MOTORS; i++) {
+                                if (motor_states[i] == 1) {
+                                    char motor_str[10];
+                                    snprintf(motor_str, sizeof(motor_str), "%s%d", first ? "" : ",", i+1);
+                                    uart_write_bytes(UART_PORT_NUM, motor_str, strlen(motor_str));
+                                    first = false;
+                                }
+                            }
+                            
+                            snprintf(response, sizeof(response), 
+                                    " | Range: %d-%dµs, Period: %ldms, Duration: %ldms\n", 
                                     low, high, period, total_time);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
@@ -994,19 +1154,47 @@ void execute_command(char* command, bool uart_feedback) {
             }
         } else {
             if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
-                "Invalid triangular command format. Use: tri <low> <high> <period> <total_time> [mac(s)]\n",
-                strlen("Invalid triangular command format. Use: tri <low> <high> <period> <total_time> [mac(s)]\n"));
+                "Invalid triangular command format. Use: tri <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)]\n"
+                "  m1-m6: 0=off, 1=on for each motor\n"
+                "  low/high: 1000-2000µs, low < high\n"
+                "  period: ≥40ms\n"
+                "  total_time: duration in ms (0 = infinite)\n",
+                strlen("Invalid triangular command format. Use: tri <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)]\n"
+                      "  m1-m6: 0=off, 1=on for each motor\n"
+                      "  low/high: 1000-2000µs, low < high\n"
+                      "  period: ≥40ms\n"
+                      "  total_time: duration in ms (0 = infinite)\n"));
         }
     }
     else if (strstr(command, "saw ")) {
+        int motor_states[NUM_MOTORS];
         uint16_t low, high;
         uint32_t period, total_time;
         
-        // Use sscanf for non-destructive parsing of the first 4 parameters
-        int parsed = sscanf(command + 4, "%hu %hu %lu %lu", &low, &high, &period, &total_time);
+        // Parse motor states and waveform parameters
+        int parsed = sscanf(command + 4, "%d %d %d %d %d %d %hu %hu %lu %lu", 
+                           &motor_states[0], &motor_states[1], &motor_states[2],
+                           &motor_states[3], &motor_states[4], &motor_states[5],
+                           &low, &high, &period, &total_time);
         
-        if (parsed == 4) {
-            // Validate parameters
+        if (parsed == 10) {
+            // Create motor mask from motor states
+            uint8_t motor_mask = 0;
+            for (int i = 0; i < NUM_MOTORS; i++) {
+                if (motor_states[i] == 1) {
+                    motor_mask |= (1 << i);
+                }
+            }
+            
+            // Validate at least one motor is selected
+            if (motor_mask == 0) {
+                if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
+                    "Error: At least one motor must be enabled (set to 1)\n",
+                    strlen("Error: At least one motor must be enabled (set to 1)\n"));
+                return;
+            }
+            
+            // Validate waveform parameters
             if (low < 1000 || high > 2000 || low >= high || period < 40) {
                 if (uart_feedback) uart_write_bytes(UART_PORT_NUM, "Invalid waveform parameters\n", strlen("Invalid waveform parameters\n"));
                 return;
@@ -1014,10 +1202,10 @@ void execute_command(char* command, bool uart_feedback) {
             
             stop_waveform_generation();
             
-            // Look for MAC addresses after the 4th parameter
+            // Look for MAC addresses after the 10th parameter
             const char *mac_start = command + 4;
-            // Advance past the first 4 parameters
-            for (int i = 0; i < 4; i++) {
+            // Advance past the first 10 parameters
+            for (int i = 0; i < 10; i++) {
                 mac_start = strchr(mac_start, ' ');
                 if (!mac_start) break;
                 mac_start++; // Move past the space
@@ -1029,6 +1217,7 @@ void execute_command(char* command, bool uart_feedback) {
                 // Send to remote devices
                 waveform_control_t wave_cmd = {
                     .type = WAVE_SAWTOOTH,
+                    .motor_mask = motor_mask,
                     .low = low,
                     .high = high,
                     .period = period,
@@ -1061,12 +1250,24 @@ void execute_command(char* command, bool uart_feedback) {
                         
                         send_message(mac, MSG_WAVEFORM_CONTROL, &wave_cmd, sizeof(wave_cmd));
                         if (uart_feedback) {
-                            char response[80];
+                            char response[100];
                             snprintf(response, sizeof(response), 
-                                    "Sawtooth wave command sent to: %s\n", token);
+                                    "Sawtooth wave command sent to: %s (motors: ", token);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                            
+                            // List enabled motors
+                            bool first = true;
+                            for (int i = 0; i < NUM_MOTORS; i++) {
+                                if (motor_states[i] == 1) {
+                                    char motor_str[10];
+                                    snprintf(motor_str, sizeof(motor_str), "%s%d", first ? "" : ",", i+1);
+                                    uart_write_bytes(UART_PORT_NUM, motor_str, strlen(motor_str));
+                                    first = false;
+                                }
+                            }
+                            uart_write_bytes(UART_PORT_NUM, ")\n", 2);
                         }
-                        ESP_LOGI(TAG, "Sending sawtooth wave to MAC: %s", token);
+                        ESP_LOGI(TAG, "Sending sawtooth wave to MAC: %s (motor_mask: 0x%02x)", token, motor_mask);
                     } else {
                         if (uart_feedback) {
                             char response[80];
@@ -1082,6 +1283,7 @@ void execute_command(char* command, bool uart_feedback) {
                 // Execute locally
                 waveform_args_t *saw_args = heap_caps_malloc(sizeof(waveform_args_t), MALLOC_CAP_8BIT);
                 if (saw_args != NULL) {
+                    saw_args->motor_mask = motor_mask;
                     saw_args->low = low;
                     saw_args->high = high;
                     saw_args->period_ms = period;
@@ -1089,15 +1291,31 @@ void execute_command(char* command, bool uart_feedback) {
                     
                     if (xTaskCreate(generate_sawtooth_wave, "saw_wave", 4096, saw_args, 5, &current_waveform.task_handle) == pdPASS) {
                         current_waveform.active = true;
+                        current_waveform.params.motor_mask = motor_mask;
                         current_waveform.params.low = low;
                         current_waveform.params.high = high;
                         current_waveform.params.period = period;
                         current_waveform.params.total_time = total_time;
                         
                         if (uart_feedback) {
-                            char response[120];
+                            char response[150];
                             snprintf(response, sizeof(response), 
-                                    "Sawtooth wave started: %d-%dµs, period:%ldms, duration:%ldms\n", 
+                                    "Sawtooth wave started on motors: ");
+                            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+                            
+                            // List enabled motors
+                            bool first = true;
+                            for (int i = 0; i < NUM_MOTORS; i++) {
+                                if (motor_states[i] == 1) {
+                                    char motor_str[10];
+                                    snprintf(motor_str, sizeof(motor_str), "%s%d", first ? "" : ",", i+1);
+                                    uart_write_bytes(UART_PORT_NUM, motor_str, strlen(motor_str));
+                                    first = false;
+                                }
+                            }
+                            
+                            snprintf(response, sizeof(response), 
+                                    " | Range: %d-%dµs, Period: %ldms, Duration: %ldms\n", 
                                     low, high, period, total_time);
                             uart_write_bytes(UART_PORT_NUM, response, strlen(response));
                         }
@@ -1117,8 +1335,16 @@ void execute_command(char* command, bool uart_feedback) {
             }
         } else {
             if (uart_feedback) uart_write_bytes(UART_PORT_NUM, 
-                "Invalid sawtooth command format. Use: saw <low> <high> <period> <total_time> [mac(s)]\n",
-                strlen("Invalid sawtooth command format. Use: saw <low> <high> <period> <total_time> [mac(s)]\n"));
+                "Invalid sawtooth command format. Use: saw <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)]\n"
+                "  m1-m6: 0=off, 1=on for each motor\n"
+                "  low/high: 1000-2000µs, low < high\n"
+                "  period: ≥40ms\n"
+                "  total_time: duration in ms (0 = infinite)\n",
+                strlen("Invalid sawtooth command format. Use: saw <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)]\n"
+                      "  m1-m6: 0=off, 1=on for each motor\n"
+                      "  low/high: 1000-2000µs, low < high\n"
+                      "  period: ≥40ms\n"
+                      "  total_time: duration in ms (0 = infinite)\n"));
         }
     }
     else if (strcmp(command, "wave stop") == 0) {
@@ -1395,12 +1621,13 @@ void execute_command(char* command, bool uart_feedback) {
             "  me - Gives MAC address of Current Device\n"
             "  led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>] - Control LED (local or remote)\n"
             "  motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac] - Control multiple motors (1000-2000 µs)\n"
-            "  sin <low> <high> <period> <total_time> [mac(s)] - Sine wave\n"
-            "  tri <low> <high> <period> <total_time> [mac(s)] - Triangular wave\n"
-            "  saw <low> <high> <period> <total_time> [mac(s)] - Sawtooth wave\n"
+            "  sin <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)] - Sine wave\n"
+            "  tri <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)] - Triangular wave\n"
+            "  saw <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)] - Sawtooth wave\n"
             "  wave stop - Stop waveform generation\n"
             "  \n"
             "  Parameters:\n"
+            "    m1-m6: 0=off, 1=on for each motor\n"
             "    low/high: 1000-2000µs, low < high\n"
             "    period: ≥40ms\n"
             "    total_time: duration in ms (0 = infinite)\n"
