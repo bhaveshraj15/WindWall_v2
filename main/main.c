@@ -73,8 +73,9 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     message_type_t msg_type;
     uint32_t sequence_num;
+    uint64_t sender_timestamp;
     uint8_t src_mac[6];
-    uint8_t data[236]; // Flexible data field
+    uint8_t data[228]; // Flexible data field
 } esp_now_message_t;
 
 static uint32_t sequence_counter = 0;
@@ -123,6 +124,21 @@ typedef struct {
 
 static waveform_state_t current_waveform = {0};
 
+// Delay measurement system
+typedef struct {
+    uint32_t total_commands;
+    uint64_t total_delay_us;
+    uint64_t min_delay_us;
+    uint64_t max_delay_us;
+    uint32_t lost_packets;
+    uint32_t sequence_errors;
+    uint32_t last_sequence;
+} delay_stats_t;
+
+static delay_stats_t delay_stats = {0};
+static bool enable_delay_monitoring = false;
+static uint64_t command_start_time = 0;
+
 // Function declarations
 void execute_command(char *command, bool uart_feedback);
 void process_command_file(const char *file_path);
@@ -145,6 +161,11 @@ void init_led_strip(void);
 void init_motor_pwm();
 void set_motor_pulse(int index, uint16_t pulse_us);
 void motor_delay_task(void *pvParameters);
+uint64_t get_current_time_us(void);
+void update_delay_stats(uint64_t delay_us);
+void print_delay_stats(void);
+void reset_delay_stats(void);
+void send_timing_ack(const uint8_t *mac, uint32_t sequence_num, uint64_t delay_us);
 
 void init_led_strip(){
     led_strip_config_t strip_config = {
@@ -313,7 +334,8 @@ void send_message(const uint8_t *mac, message_type_t type, const void *data, siz
     }
     esp_now_message_t msg;
     msg.msg_type = type;
-    msg.sequence_num = sequence_counter++;
+    msg.sequence_num = sequence_counter;
+    msg.sender_timestamp = get_current_time_us();
     esp_read_mac(msg.src_mac, ESP_MAC_WIFI_STA);
     if (len > 0) {
         memcpy(msg.data, data, len);
@@ -322,6 +344,8 @@ void send_message(const uint8_t *mac, message_type_t type, const void *data, siz
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Send error: %d", ret);
         set_led_color(32, 16, 0, 200, 100); // Orange flash for send error
+    } else {
+        sequence_counter++;  // Only increment on successful send
     }
 }
 
@@ -383,6 +407,15 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
     esp_now_message_t *msg = (esp_now_message_t *)data;
+    uint64_t receive_time = get_current_time_us();
+    uint64_t delay_us = receive_time - msg->sender_timestamp;
+    
+    // Log delay for relevant message types
+    if (msg->msg_type == MSG_MOTOR_CONTROL || msg->msg_type == MSG_WAVEFORM_CONTROL || 
+        msg->msg_type == MSG_LED_CONTROL) {
+        update_delay_stats(delay_us);
+    }
+
     // Ignore messages from ourselves
     uint8_t my_mac[6];
     esp_read_mac(my_mac, ESP_MAC_WIFI_STA);
@@ -390,7 +423,7 @@ void handle_receive(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
     log_mac("Received from:", mac);
-    ESP_LOGI(TAG, "Sequence: %lu, Type: %d", msg->sequence_num, msg->msg_type);
+    ESP_LOGI(TAG, "Sequence: %lu, Type: %d, Delay: %llu µs", msg->sequence_num, msg->msg_type, delay_us);
     bool peer_found = false;
     for (int i = 0; i < peer_count; i++) {
         if (memcmp(peers[i].mac, mac, 6) == 0) {
@@ -739,6 +772,73 @@ void esp_now_send_cb(const uint8_t *mac, esp_now_send_status_t status) {
     log_mac("Send status:", mac);
     ESP_LOGI(TAG, "Status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
+
+// Get current time in microseconds
+uint64_t get_current_time_us(void) {
+    return esp_timer_get_time();
+}
+
+// Update delay statistics
+void update_delay_stats(uint64_t delay_us) {
+    delay_stats.total_commands++;
+    delay_stats.total_delay_us += delay_us;
+    
+    if (delay_us < delay_stats.min_delay_us || delay_stats.min_delay_us == 0) {
+        delay_stats.min_delay_us = delay_us;
+    }
+    if (delay_us > delay_stats.max_delay_us) {
+        delay_stats.max_delay_us = delay_us;
+    }
+    
+    // Check for sequence errors
+    if (delay_stats.total_commands > 1) {
+        uint32_t expected_sequence = delay_stats.last_sequence + 1;
+        if (expected_sequence != sequence_counter) {
+            delay_stats.sequence_errors++;
+            ESP_LOGW(TAG, "Sequence error: expected %lu, got %lu", expected_sequence, sequence_counter);
+        }
+    }
+    delay_stats.last_sequence = sequence_counter;
+    
+    // Log if monitoring is enabled
+    if (enable_delay_monitoring) {
+        ESP_LOGI(TAG, "Command delay: %llu µs", delay_us);
+    }
+}
+
+// Print comprehensive statistics
+void print_delay_stats(void) {
+    if (delay_stats.total_commands == 0) {
+        ESP_LOGI(TAG, "No delay statistics available yet");
+        return;
+    }
+    
+    uint64_t avg_delay = delay_stats.total_delay_us / delay_stats.total_commands;
+    float packet_loss_rate = (float)delay_stats.lost_packets / (delay_stats.total_commands + delay_stats.lost_packets) * 100.0f;
+    
+    ESP_LOGI(TAG, "=== DELAY STATISTICS ===");
+    ESP_LOGI(TAG, "Total commands: %u", delay_stats.total_commands);
+    ESP_LOGI(TAG, "Min delay: %llu µs (%.3f ms)", delay_stats.min_delay_us, delay_stats.min_delay_us / 1000.0f);
+    ESP_LOGI(TAG, "Avg delay: %llu µs (%.3f ms)", avg_delay, avg_delay / 1000.0f);
+    ESP_LOGI(TAG, "Max delay: %llu µs (%.3f ms)", delay_stats.max_delay_us, delay_stats.max_delay_us / 1000.0f);
+    ESP_LOGI(TAG, "Lost packets: %u (%.1f%%)", delay_stats.lost_packets, packet_loss_rate);
+    ESP_LOGI(TAG, "Sequence errors: %u", delay_stats.sequence_errors);
+    ESP_LOGI(TAG, "=========================");
+}
+
+// Reset statistics
+void reset_delay_stats(void) {
+    memset(&delay_stats, 0, sizeof(delay_stats));
+    ESP_LOGI(TAG, "Delay statistics reset");
+}
+
+// Send timing acknowledgment (optional)
+void send_timing_ack(const uint8_t *mac, uint32_t sequence_num, uint64_t delay_us) {
+    char ack_data[50];
+    snprintf(ack_data, sizeof(ack_data), "ACK:%lu:%llu", sequence_num, delay_us);
+    send_message(mac, MSG_DATA, ack_data, strlen(ack_data) + 1);
+}
+
 // Function to execute a command
 void execute_command(char* command, bool uart_feedback) {
     // Remove newline characters
@@ -1603,6 +1703,53 @@ void execute_command(char* command, bool uart_feedback) {
                             strlen("Loop command only supported in command files\n"));
         }
     }
+    else if (strcmp(command, "stats") == 0) {
+        print_delay_stats();
+        // Also send to UART
+        if (delay_stats.total_commands == 0) {
+            uart_write_bytes(UART_PORT_NUM, "No delay statistics available\n", 
+                            strlen("No delay statistics available\n"));
+        } else {
+            uint64_t avg_delay = delay_stats.total_delay_us / delay_stats.total_commands;
+            char response[200];
+            snprintf(response, sizeof(response), "Delay Statistics:\n"
+                    "Commands: %lu\n"
+                    "Min: %llu µs (%.2f ms)\n"
+                    "Avg: %llu µs (%.2f ms)\n"
+                    "Max: %llu µs (%.2f ms)\n"
+                    "Lost: %lu packets\n"
+                    "Seq Errors: %lu\n",
+                    delay_stats.total_commands,
+                    delay_stats.min_delay_us, delay_stats.min_delay_us / 1000.0,
+                    avg_delay, avg_delay / 1000.0,
+                    delay_stats.max_delay_us, delay_stats.max_delay_us / 1000.0,
+                    delay_stats.lost_packets, delay_stats.sequence_errors);
+            uart_write_bytes(UART_PORT_NUM, response, strlen(response));
+        }
+    }
+    else if (strcmp(command, "monitor on") == 0) {
+        enable_delay_monitoring = true;
+        uart_write_bytes(UART_PORT_NUM, "Delay monitoring enabled\n", 
+                        strlen("Delay monitoring enabled\n"));
+    }
+    else if (strcmp(command, "monitor off") == 0) {
+        enable_delay_monitoring = false;
+        uart_write_bytes(UART_PORT_NUM, "Delay monitoring disabled\n", 
+                        strlen("Delay monitoring disabled\n"));
+    }
+    else if (strcmp(command, "stats reset") == 0) {
+        reset_delay_stats();
+        uart_write_bytes(UART_PORT_NUM, "Statistics reset\n", 
+                        strlen("Statistics reset\n"));
+    }
+    else if (strstr(command, "test delay")) {
+        // Send a test command to measure delay
+        uint8_t broadcast_mac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        char test_data[] = "Delay test message";
+        send_message(broadcast_mac, MSG_DATA, test_data, strlen(test_data) + 1);
+        uart_write_bytes(UART_PORT_NUM, "Delay test sent\n", 
+                        strlen("Delay test sent\n"));
+    }
     else if (strcmp(command, "end") == 0) {
         if (uart_feedback) {
             uart_write_bytes(UART_PORT_NUM, 
@@ -1632,6 +1779,14 @@ void execute_command(char* command, bool uart_feedback) {
             "    period: ≥40ms\n"
             "    total_time: duration in ms (0 = infinite)\n"
             "    mac: optional target devices\n"
+            "  \n"
+            "Delay Measurement Commands:\n"
+            "  stats - Show delay statistics\n"
+            "  stats reset - Reset delay statistics\n"
+            "  monitor on - Enable real-time delay monitoring\n"
+            "  monitor off - Disable real-time delay monitoring\n"
+            "  test delay - Send test message for delay measurement\n"
+            "  \n"
             "  addmac <MAC>- Add a MAC to known list\n"
             "  execute <file_path> - Execute a COMMANDs file </spiffs/commands.txt>\n"
             "  hold <time_ms> - Pause execution for specified milliseconds\n"
