@@ -1,0 +1,47 @@
+# In ESP-IDF Terminal, write <idf.py storage-flash> to update the 'spiffs' folder.
+# execute /spiffs/commands.txt
+
+# ========================================================================================
+# A0:85:E3:E8:00:EC master
+# B4:3A:45:A3:54:04 left mid
+# FC:01:2C:C5:4A:48 right mid
+# 94:A9:90:2E:92:08 right bottom
+# F0:9E:9E:1E:4A:E4 left bottom
+# F0:9E:9E:1E:4A:84 left top
+# F0:9E:9E:21:E2:70 right top
+
+# ========================================================================================
+# Available commands:
+#   discover - Initiate peer discovery
+#   list - List all known peers
+#   send <MAC> <message> - Send message to peer
+#   remove <MAC> - Remove a peer
+#   me - Gives MAC address of Current Device
+#   led <r> <g> <b> <timeout_ms> <blank_ms> [<MAC>] - Control LED (local or remote)
+#   motor <m1> <m2> <m3> <m4> <m5> <m6> <delay time> [mac] - Control multiple motors (1000-2000 µs)
+#   sin <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)] - Sine wave
+#   tri <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)] - Triangular wave
+#   saw <m1> <m2> <m3> <m4> <m5> <m6> <low> <high> <period> <total_time> [mac(s)] - Sawtooth wave
+#   wave stop - Stop waveform generation
+
+#   Parameters:
+#     m1-m6: 0=off, 1=on for each motor
+#     low/high: 1000-2000µs, low < high
+#     period: ≥40ms
+#     total_time: duration in ms (0 = infinite)
+#     mac: optional target devices
+
+# Delay Measurement Commands:
+#   stats - Show delay statistics
+#   stats reset - Reset delay statistics
+#   monitor on - Enable real-time delay monitoring
+#   monitor off - Disable real-time delay monitoring
+#   test delay - Send test message for delay measurement
+
+#   addmac <MAC>- Add a MAC to known list
+#   execute <file_path> - Execute a COMMANDs file </spiffs/commands.txt>
+#   hold <time_ms> - Pause execution for specified milliseconds
+#   loop <count> - Start a loop block (must be followed by 'end')
+#   end - End a loop block
+#   help - Show this help
+# ========================================================================================
